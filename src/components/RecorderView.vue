@@ -6,167 +6,50 @@
         <div>
           <h2 class="text-xl font-semibold text-gray-900">Nova Reunião</h2>
           <p class="text-sm text-gray-500 mt-1">
-            {{
-              isRecording ? "Gravação em andamento..." : "Pronto para gravar"
-            }}
+            {{ isRecording ? "Gravação em andamento..." : "Pronto para gravar" }}
           </p>
         </div>
 
         <div class="flex items-center space-x-3">
-          <!-- Status da gravação -->
-          <div class="flex items-center space-x-2">
-            <div
-              :class="[
-                'w-3 h-3 rounded-full',
-                isRecording
-                  ? 'bg-red-500 animate-pulse'
-                  : 'bg-gray-300',
-              ]"
-            ></div>
-            <span class="text-sm text-gray-600">
-              {{
-                isRecording
-                  ? `${formatDuration(recordingDuration)}`
-                  : "Parado"
-              }}
-            </span>
-          </div>
-
-          <!-- Botões de controle -->
-          <div class="flex space-x-2">
-            <button
-              v-if="!isRecording"
-              @click="startRecording"
-              :disabled="!isSupported || isProcessing"
-              class="inline-flex items-center px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              <svg
-                class="w-4 h-4 mr-2"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-                />
-              </svg>
-              Iniciar Gravação
-            </button>
-
-            <button
-              v-if="isRecording"
-              @click="stopRecording"
-              class="inline-flex items-center px-4 py-2 text-sm font-medium text-white bg-gray-600 rounded-md hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 transition-colors"
-            >
-              <svg
-                class="w-4 h-4 mr-2"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                />
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"
-                />
-              </svg>
-              Parar Gravação
-            </button>
-
-            <button
-              v-if="transcript && !isRecording"
-              @click="clearTranscript"
-              class="inline-flex items-center px-3 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors"
-              title="Limpar transcrição"
-            >
-              <svg
-                class="w-4 h-4"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
-                />
-              </svg>
-            </button>
-          </div>
+          <StatusIndicator 
+            :is-active="isRecording" 
+            :status-text="isRecording ? formatDuration(recordingDuration) : 'Parado'" 
+          />
+          <RecordingControls 
+            :is-recording="isRecording"
+            :is-supported="isSupported"
+            :is-processing="isProcessing"
+            :transcript="transcript"
+            @start-recording="startRecording"
+            @stop-recording="stopRecording"
+            @clear-transcript="clearTranscript"
+          />
         </div>
       </div>
     </div>
 
     <!-- Conteúdo principal -->
     <div class="flex-1 overflow-y-auto p-6">
-      <!-- Mensagem de erro -->
-      <div v-if="error" class="mb-6">
-        <div class="bg-red-50 border border-red-200 rounded-md p-4">
-          <div class="flex">
-            <svg
-              class="w-5 h-5 text-red-400 mt-0.5"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="2"
-                d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-              />
-            </svg>
-            <div class="ml-3">
-              <h3 class="text-sm font-medium text-red-800">Erro na gravação</h3>
-              <p class="text-sm text-red-700 mt-1">{{ error }}</p>
-            </div>
-          </div>
-        </div>
-      </div>
+      <!-- Alerts -->
+      <AlertBox
+        v-if="error"
+        type="error"
+        title="Erro na gravação"
+        :message="error"
+      />
 
-      <!-- Aviso de suporte -->
-  <div v-if="!isSupported" class="mb-6">
-        <div class="bg-yellow-50 border border-yellow-200 rounded-md p-4">
-          <div class="flex">
-            <svg
-              class="w-5 h-5 text-yellow-400 mt-0.5"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="2"
-                d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z"
-              />
-            </svg>
-            <div class="ml-3">
-              <h3 class="text-sm font-medium text-yellow-800">
-                Captura não suportada
-              </h3>
-              <p class="text-sm text-yellow-700 mt-1">
-                Nenhuma API de áudio está disponível. Verifique permissões do
-                sistema e reinicie o aplicativo.
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
+      <AlertBox
+        v-if="!isSupported"
+        type="warning"
+        title="Captura não suportada"
+        message="Nenhuma API de áudio está disponível. Verifique permissões do sistema e reinicie o aplicativo."
+      />
 
       <!-- Status da API -->
-  <div v-if="apiStatus && apiStatus.status && apiStatus.status !== 'success'" class="mb-6">
+      <div
+        v-if="apiStatus && apiStatus.status && apiStatus.status !== 'success'"
+        class="mb-6"
+      >
         <div
           :class="[
             'border rounded-md p-4',
@@ -238,267 +121,26 @@
         </div>
       </div>
 
-      <!-- Estado de processamento -->
-      <div v-if="isProcessing" class="mb-6">
-        <div class="bg-blue-50 border border-blue-200 rounded-md p-4">
-          <div class="flex items-center">
-            <svg
-              class="animate-spin w-5 h-5 text-blue-500 mr-3"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="2"
-                d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-              />
-            </svg>
-            <div>
-              <h3 class="text-sm font-medium text-blue-800">
-                Processando com IA...
-              </h3>
-              <p class="text-sm text-blue-700 mt-1">
-                Gerando resumo da reunião. Isso pode levar alguns segundos.
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
+      <AlertBox
+        v-if="isProcessing"
+        type="info"
+        title="Processando com IA..."
+        :message="!transcript ? 'Processando áudio. Para reuniões longas, dividimos em partes menores - isso pode levar alguns minutos.' : 'Gerando resumo da reunião. Isso pode levar alguns segundos.'"
+      />
 
       <!-- Área de transcrição -->
       <div class="space-y-6">
-        <!-- Transcrição em tempo real -->
-        <div class="bg-gray-50 rounded-lg p-6 border border-gray-200">
-          <div class="flex items-center justify-between mb-4">
-            <h3 class="text-lg font-medium text-gray-900">Transcrição</h3>
-            <div class="flex items-center space-x-2">
-              <span class="text-sm text-gray-500">
-                {{ transcript.length }} caracteres
-              </span>
-              <button
-                v-if="transcript"
-                @click="copyTranscript"
-                class="text-sm text-blue-600 hover:text-blue-800 font-medium"
-                title="Copiar transcrição"
-              >
-                Copiar
-              </button>
-            </div>
-          </div>
+        <TranscriptDisplay :transcript="transcript" :is-recording="isRecording" />
 
-          <div class="min-h-[200px] max-h-[400px] overflow-y-auto">
-            <div v-if="!transcript && !isRecording" class="text-center text-gray-500 py-16">
-              <svg
-                class="w-16 h-16 mx-auto mb-4 text-gray-300"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-                />
-              </svg>
-              <p class="text-lg font-medium">
-                Inicie a gravação para ver a transcrição
-              </p>
-              <p class="text-sm text-gray-400 mt-1">
-                O texto aparecerá aqui conforme você fala
-              </p>
-            </div>
+        <PostRecordingActions
+          v-if="transcript && !isRecording && !isProcessing"
+          @generate-summary="generateSummary"
+          @download-transcript="downloadTranscript"
+          @save-transcript="saveWithoutSummary"
+        />
 
-            <div v-if="!transcript && isRecording" class="text-center text-gray-500 py-16">
-              <div class="animate-pulse">
-                <svg
-                  class="w-16 h-16 mx-auto mb-4 text-red-400"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="2"
-                    d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-                  />
-                </svg>
-              </div>
-              <p class="text-lg font-medium">Ouvindo...</p>
-              <p class="text-sm text-gray-400 mt-1">
-                Comece a falar para ver a transcrição
-              </p>
-            </div>
 
-            <div v-if="transcript" class="prose max-w-none">
-              <p class="text-gray-900 whitespace-pre-wrap leading-relaxed">
-                {{ transcript }}
-                <span
-                  v-if="isRecording"
-                  class="inline-block w-0.5 h-5 bg-red-500 animate-pulse ml-1"
-                ></span>
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <!-- Ações após gravação -->
-  <div v-if="transcript && !isRecording && !isProcessing" class="bg-white border border-gray-200 rounded-lg p-6">
-          <h3 class="text-lg font-medium text-gray-900 mb-4">
-            Próximos Passos
-          </h3>
-          <div class="space-y-3">
-            <button
-              @click="generateSummary"
-              class="w-full inline-flex items-center justify-center px-4 py-3 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors"
-            >
-              <svg
-                class="w-5 h-5 mr-2"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                />
-              </svg>
-              Gerar Resumo com IA
-            </button>
-
-            <div class="grid grid-cols-2 gap-3">
-              <button
-                @click="downloadTranscript"
-                class="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors"
-              >
-                <svg
-                  class="w-4 h-4 mr-2"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="2"
-                    d="M12 10v6m0 0l-3-3m3 3l3-3M3 17V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v10a2 2 0 01-2 2H5a2 2 0 01-2-2z"
-                  />
-                </svg>
-                Baixar TXT
-              </button>
-
-              <button
-                @click="saveWithoutSummary"
-                class="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors"
-              >
-                <svg
-                  class="w-4 h-4 mr-2"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="2"
-                    d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"
-                  />
-                </svg>
-                Salvar Apenas Transcrição
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <!-- Mensagem de fallback -->
-        <!-- Processar áudio gravado (novo fluxo simplificado) -->
-        <div v-if="hasAudio && !transcript && !isProcessing" class="bg-white border border-gray-200 rounded-lg p-6">
-          <h3 class="text-lg font-medium text-gray-900 mb-4">Processar Áudio Gravado</h3>
-          <button @click="processAudio" class="w-full inline-flex items-center justify-center px-4 py-3 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors">
-            <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-            </svg>
-            Transcrever & Resumir com IA
-          </button>
-        </div>
-
-        <!-- Dicas de uso -->
-  <div v-if="!transcript && !isRecording" class="bg-blue-50 border border-blue-200 rounded-lg p-6">
-          <h3 class="text-lg font-medium text-blue-900 mb-4">
-            Dicas para uma boa gravação
-          </h3>
-          <ul class="space-y-2 text-sm text-blue-800">
-            <li class="flex items-start">
-              <svg
-                class="w-4 h-4 text-blue-500 mt-0.5 mr-2 flex-shrink-0"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M5 13l4 4L19 7"
-                />
-              </svg>
-              Fale de forma clara e pausada
-            </li>
-            <li class="flex items-start">
-              <svg
-                class="w-4 h-4 text-blue-500 mt-0.5 mr-2 flex-shrink-0"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M5 13l4 4L19 7"
-                />
-              </svg>
-              Mantenha-se próximo ao microfone
-            </li>
-            <li class="flex items-start">
-              <svg
-                class="w-4 h-4 text-blue-500 mt-0.5 mr-2 flex-shrink-0"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M5 13l4 4L19 7"
-                />
-              </svg>
-              Evite ruídos de fundo
-            </li>
-            <li class="flex items-start">
-              <svg
-                class="w-4 h-4 text-blue-500 mt-0.5 mr-2 flex-shrink-0"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M5 13l4 4L19 7"
-                />
-              </svg>
-              A transcrição será gerada após processar o áudio gravado
-            </li>
-          </ul>
-        </div>
+        <RecordingTips v-if="!transcript && !isRecording && !hasAudio" />
       </div>
     </div>
   </div>
@@ -509,12 +151,34 @@ import { onMounted, onUnmounted, ref, watch } from "vue";
 import { useConfig } from "../composables/useConfig.js";
 import { useHistory } from "../composables/useHistory.js";
 import { useRecorder } from "../composables/useRecorder.js";
+import { formatDuration, downloadFile, formatTimestamp } from "../utils/formatters.js";
+
+// UI Components
+import StatusIndicator from "./ui/StatusIndicator.vue";
+import AlertBox from "./ui/AlertBox.vue";
+import RecordingControls from "./recorder/RecordingControls.vue";
+import TranscriptDisplay from "./recorder/TranscriptDisplay.vue";
+import PostRecordingActions from "./recorder/PostRecordingActions.vue";
+import RecordingTips from "./recorder/RecordingTips.vue";
 
 // Emits
 const emit = defineEmits(["summary-generated"]);
 
 // Composables
-const { isRecording, isProcessing, isSupported, transcript, error, startRecording: startRec, stopRecording: stopRec, clearTranscript, generateSummaryFromAI, hasAudio, audioBlob } = useRecorder();
+const {
+  isRecording,
+  isProcessing,
+  isSupported,
+  transcript,
+  error,
+  startRecording: startRec,
+  stopRecording: stopRec,
+  clearTranscript,
+  transcribeAudio,
+  generateSummaryFromTranscript,
+  hasAudio,
+  audioBlob,
+} = useRecorder();
 
 const { saveMeeting } = useHistory();
 const { apiStatus } = useConfig();
@@ -529,25 +193,27 @@ let removeStartRecordingListener = null;
 onMounted(() => {
   // Registra listener para detecção automática de reunião
   if (window.electronAPI?.onStartRecording) {
-    removeStartRecordingListener = window.electronAPI.onStartRecording((meetingData) => {
-      console.log('🎬 Reunião detectada automaticamente:', meetingData);
-      
-      // Inicia gravação automaticamente se não estiver gravando
-      if (!isRecording.value && !isProcessing.value) {
-        console.log('🚀 Iniciando gravação automática...');
-        startRecording();
-        
-        // Mostra notificação de feedback
-        if (window.electronAPI?.showNotification) {
-          window.electronAPI.showNotification(
-            'Gravação Iniciada',
-            `Gravação automática iniciada para ${meetingData.app}`
-          );
+    removeStartRecordingListener = window.electronAPI.onStartRecording(
+      (meetingData) => {
+        console.log("🎬 Reunião detectada automaticamente:", meetingData);
+
+        // Inicia gravação automaticamente se não estiver gravando
+        if (!isRecording.value && !isProcessing.value) {
+          console.log("🚀 Iniciando gravação automática...");
+          startRecording();
+
+          // Mostra notificação de feedback
+          if (window.electronAPI?.showNotification) {
+            window.electronAPI.showNotification(
+              "Gravação Iniciada",
+              `Gravação automática iniciada para ${meetingData.app}`
+            );
+          }
+        } else {
+          console.log("⚠️ Gravação já em andamento, ignorando...");
         }
-      } else {
-        console.log('⚠️ Gravação já em andamento, ignorando...');
       }
-    });
+    );
   }
 });
 
@@ -561,14 +227,7 @@ onUnmounted(() => {
   }
 });
 
-// Computed
-const formatDuration = (seconds) => {
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  return `${minutes.toString().padStart(2, "0")}:${remainingSeconds
-    .toString()
-    .padStart(2, "0")}`;
-};
+// Usando função utilitaria importada
 
 // Métodos
 const startRecording = async () => {
@@ -595,47 +254,68 @@ const processAudio = async () => {
     return;
   }
   try {
-    const summary = await generateSummaryFromAI();
-    const meeting = saveMeeting(transcript.value, summary);
-    emit("summary-generated", meeting);
+    const fileSizeMB = audioBlob.value.size / (1024 * 1024);
+    const durationMinutes = (recordingDuration.value || 0) / 60;
+    
+    // Mostrar info do arquivo para o usuário
+    console.log(`🎵 Processando áudio: ${fileSizeMB.toFixed(1)}MB, ${durationMinutes.toFixed(1)} minutos`);
+    
+    await transcribeAudio();
+    
     if (window.electronAPI?.showNotification) {
-      window.electronAPI.showNotification("Resumo Gerado", "Resumo criado com sucesso!");
+      window.electronAPI.showNotification(
+        "Transcrição Concluída", 
+        `Áudio de ${durationMinutes.toFixed(1)} min processado com sucesso!`
+      );
     }
   } catch (err) {
-    console.error("Erro ao processar áudio:", err);
-    alert("Erro ao processar áudio. Verifique a chave da API e tente novamente.");
+    console.error("Erro ao transcrever áudio:", err);
+    
+    // Mensagens de erro mais específicas
+    let errorMessage = "Erro ao transcrever áudio. ";
+    
+    if (err.message.includes('limit') || err.message.includes('grande')) {
+      errorMessage += "Processando reunião longa em partes menores. Aguarde...";
+    } else if (err.message.includes('timeout') || err.message.includes('Timeout')) {
+      errorMessage += "A API demorou muito para processar. Tente novamente.";
+    } else if (err.message.includes('API ausente')) {
+      errorMessage += "Chave da API não configurada. Verifique o arquivo .env";
+    } else if (err.message.includes('upload')) {
+      errorMessage += "Falha no upload do arquivo. Verifique sua conexão.";
+    } else {
+      errorMessage += err.message;
+    }
+    
+    alert(errorMessage);
   }
 };
 
-const copyTranscript = async () => {
+const generateSummary = async () => {
+  if (!transcript.value) {
+    alert("Nenhuma transcrição disponível.");
+    return;
+  }
   try {
-    await navigator.clipboard.writeText(transcript.value);
-    // Feedback visual temporário
-    const button = event.target;
-    const originalText = button.textContent;
-    button.textContent = "Copiado!";
-    setTimeout(() => {
-      button.textContent = originalText;
-    }, 2000);
+    const summary = await generateSummaryFromTranscript();
+    const meeting = saveMeeting(transcript.value, summary);
+    emit("summary-generated", meeting);
+    if (window.electronAPI?.showNotification) {
+      window.electronAPI.showNotification(
+        "Resumo Gerado",
+        "Resumo criado com sucesso!"
+      );
+    }
   } catch (err) {
-    console.error("Erro ao copiar:", err);
-    alert("Erro ao copiar transcrição.");
+    console.error("Erro ao gerar resumo:", err);
+    alert(
+      "Erro ao gerar resumo. Verifique a chave da API e tente novamente."
+    );
   }
 };
 
 const downloadTranscript = () => {
-  const blob = new Blob([transcript.value], { type: "text/plain" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `transcricao-${new Date()
-    .toISOString()
-    .slice(0, 19)
-    .replace(/:/g, "-")}.txt`;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  URL.revokeObjectURL(url);
+  const filename = `transcricao-${formatTimestamp()}.txt`;
+  downloadFile(transcript.value, filename);
 };
 
 const saveWithoutSummary = () => {
@@ -666,10 +346,10 @@ watch(isRecording, (newValue) => {
   }
 });
 
-// Opcional: iniciar processamento automático ao parar (comente se quiser somente manual)
+// Processamento automático da transcrição após parar gravação
 watch(hasAudio, (val) => {
-  if (val && !transcript.value) {
-    // Auto-processamento; remover se preferir manual
+  if (val && !transcript.value && !isProcessing.value) {
+    // Auto-transcrição após parar gravação
     processAudio();
   }
 });

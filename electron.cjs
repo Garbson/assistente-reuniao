@@ -2,23 +2,21 @@
 const { app, BrowserWindow, ipcMain, Notification, shell, session } = require('electron');
 const { exec } = require('child_process');
 const path = require('path');
+
 // Importação resiliente do active-win (ESM default export)
 let activeWinModule = null;
-let activeWindowFunction = null;
-
-async function initActiveWin() {
-  try {
-    activeWinModule = await import('active-win');
-    activeWindowFunction = activeWinModule.activeWindow;
-    console.log('✅ active-win carregado com sucesso');
-  } catch (e) {
-    console.warn('❌ active-win não pôde ser carregado:', e.message);
-  }
+try {
+  activeWinModule = require('active-win');
+} catch (e) {
+  console.warn('active-win não instalado ou falhou ao carregar.');
 }
 
 function getActiveWinFunction() {
-  return activeWindowFunction;
+  if (!activeWinModule) return null;
+  const fn = (typeof activeWinModule === 'function') ? activeWinModule : activeWinModule.default;
+  return (typeof fn === 'function') ? fn : null;
 }
+
 let lastActiveWinErrorAt = 0;
 
 // Ajustes de linha de comando ANTES do app.whenReady para habilitar recursos necessários ao reconhecimento de voz
@@ -39,214 +37,101 @@ let meetingMonitorInterval = null;
 let overlayWindow = null;
 let lastReminderAt = 0;
 let lastMeetingTitle = '';
-// Novos controles para reduzir falsos positivos
-const STABLE_THRESHOLD_MS = 10000; // 10 segundos para ter certeza
-let candidateTitle = null;
-let candidateSince = 0;
-const notifiedTitles = new Set();
 
-// Configurações de monitoramento de reuniões REFINADAS
-const MEETING_DETECTION_INTERVAL = 7000; // 7 segundos conforme especificação
+// Configurações de monitoramento de reuniões APRIMORADAS
+const MEETING_KEYWORDS = [
+  'Google Meet', 'Microsoft Teams', 'Zoom Meeting', 'Zoom', 'Teams',
+  'Meet', 'Skype', 'Discord', 'Webex', 'GoToMeeting', 'Reunião'
+];
 
-// Mapa para rastrear notificações já enviadas
-const notifiedMeetings = new Map();
+const MEETING_URLS = [
+  'meet.google.com', 'teams.microsoft.com', 'zoom.us', 'us02web.zoom.us',
+  'teams.live.com', 'discord.com', 'webex.com', 'gotomeeting.com'
+];
 
-// Função refinada para detectar reuniões com lógica específica por aplicativo
-function detectMeetingFromWindow(activeWindow) {
-  if (!activeWindow || !activeWindow.title || activeWindow.title.trim() === '') {
-    return { isMeeting: false, reason: 'Janela inválida ou sem título' };
-  }
-
-  // Verifica se owner existe e tem name, senão usa string vazia
-  const ownerName = activeWindow.owner?.name || activeWindow.owner?.processName || '';
-  const processName = ownerName.toLowerCase();
-  const windowTitle = activeWindow.title.toLowerCase();
-  
-  // Não logga se não há processo definido para evitar spam
-  if (processName && process.env.NODE_ENV === 'development') {
-    console.log(`🔍 Analisando: Processo="${processName}" Título="${windowTitle.substring(0, 50)}..."`);
-  }
-  
-  // Se não há processo identificado, tenta identificar pelo título
-  if (!processName) {
-    // Tentativa de identificar pelo título se não temos processo
-    if (windowTitle.includes('microsoft teams') || windowTitle.includes('teams -')) {
-      if (windowTitle.includes('reunião') || windowTitle.includes('chamada') || 
-          windowTitle.includes('meeting') || windowTitle.includes('call')) {
-        return { 
-          isMeeting: true, 
-          app: 'Teams (by title)',
-          reason: `Teams meeting detected by title: ${activeWindow.title}` 
-        };
-      }
-    }
-    return { isMeeting: false, reason: 'Processo não identificado e título não corresponde' };
-  }
-  
-  // 1. Verificação Microsoft Teams - Melhorada para diferentes padrões
-  if (processName.includes('teams') || processName === 'ms-teams.exe') {
-    console.log('🔍 TEAMS DEBUG:', {
-      titulo: windowTitle,
-      temSala: windowTitle.includes('sala '),
-      temPipe: windowTitle.includes(' | '),
-      regexMatch: /^.+ - .+ \| .+/.test(windowTitle),
-      naoETeamsApp: !windowTitle.includes('microsoft teams')
-    });
-    
-    // Padrões específicos do Teams
-    const isTeamsMeeting = 
-      // Padrões tradicionais
-      windowTitle.includes('| reunião') || 
-      windowTitle.includes('| chamada') ||
-      windowTitle.includes('| meeting') ||
-      windowTitle.includes('| call') ||
-      // Padrão de reunião com nome da sala/empresa (como seu caso)
-      (windowTitle.includes('sala ') && windowTitle.includes(' | ')) ||
-      (windowTitle.includes('room ') && windowTitle.includes(' | ')) ||
-      // Qualquer título com estrutura "Nome - Algo | Organização"
-      (/^.+ - .+ \| .+/.test(windowTitle) && !windowTitle.includes('microsoft teams'));
-      
-    if (isTeamsMeeting) {
-      return { 
-        isMeeting: true, 
-        app: 'Teams',
-        reason: `Teams meeting detected: ${activeWindow.title}` 
-      };
-    }
-  }
-  
-  // 2. Verificação Zoom
-  if (processName.includes('zoom')) {
-    if (windowTitle.includes('zoom meeting') || 
-        windowTitle.includes('reunião zoom') ||
-        windowTitle.includes('zoom webinar')) {
-      return { 
-        isMeeting: true, 
-        app: 'Zoom',
-        reason: `Zoom meeting detected: ${activeWindow.title}` 
-      };
-    }
-  }
-  
-  // 3. Verificação Google Meet (Navegador) - Melhorada
-  const browserProcesses = ['chrome.exe', 'msedge.exe', 'firefox.exe', 'safari', 'opera.exe'];
-  const isBrowser = browserProcesses.some(browser => processName.includes(browser.toLowerCase()));
-  
-  if (isBrowser) {
-    // Padrões específicos do Google Meet
-    if (windowTitle.includes('meet.google.com') || 
-        windowTitle.startsWith('meet: ') ||
-        (windowTitle.includes('meet:') && windowTitle.includes('google chrome'))) {
-      return { 
-        isMeeting: true, 
-        app: 'Google Meet',
-        reason: `Google Meet detected: ${activeWindow.title}` 
-      };
-    }
-    
-    // 4. Verificações para Teams/Zoom web (após Google Meet)
-    if (windowTitle.includes('teams.microsoft.com') && 
-        (windowTitle.includes('call') || windowTitle.includes('meeting'))) {
-      return { 
-        isMeeting: true, 
-        app: 'Teams Web',
-        reason: `Teams Web meeting detected: ${activeWindow.title}` 
-      };
-    }
-    
-    if (windowTitle.includes('zoom.us') && windowTitle.includes('meeting')) {
-      return { 
-        isMeeting: true, 
-        app: 'Zoom Web',
-        reason: `Zoom Web meeting detected: ${activeWindow.title}` 
-      };
-    }
-  }
-  
-  return { isMeeting: false, reason: 'Não corresponde aos padrões de reunião' };
-}
+const MEETING_PROCESSES = [
+  'teams.exe', 'zoom.exe', 'skype.exe', 'discord.exe', 'chrome.exe', 'msedge.exe'
+];
 
 // Estados de detecção melhorados
 let isInMeeting = false;
 let teamsPresenceStatus = 'unknown'; // Available, Busy, DoNotDisturb, etc.
 
-// Função para detectar status do Teams via processos Windows
+// Novos controles para reduzir falsos positivos
+const STABLE_THRESHOLD_MS = 6000; // tempo que a janela precisa ficar ativa
+let candidateTitle = null;
+let candidateSince = 0;
+const notifiedTitles = new Set();
+
+// Função NOVA: Detectar status do Teams via processo/registry
 async function detectTeamsPresence() {
   return new Promise((resolve) => {
-    // Verifica se Teams (novo) está rodando
+    // Verifica se Teams está em modo ocupado/em reunião via processo Windows
     exec('tasklist /fi "imagename eq ms-teams.exe" /fo csv | findstr "ms-teams.exe"', (err, stdout) => {
       if (err || !stdout.trim()) {
-        // Teams novo não encontrado, verifica Teams clássico
+        // Teams não está rodando, verifica Teams clássico
         exec('tasklist /fi "imagename eq teams.exe" /fo csv | findstr "teams.exe"', (err2, stdout2) => {
           if (err2 || !stdout2.trim()) {
             resolve({ running: false, status: 'unknown' });
             return;
           }
-          // Teams clássico encontrado
+          // Teams clássico encontrado, assume disponível
           resolve({ running: true, status: 'available', type: 'classic' });
         });
         return;
       }
       
-      // Teams novo encontrado, assume disponível por padrão
-      // Em versões futuras podemos implementar detecção mais sofisticada
-      resolve({ running: true, status: 'available', type: 'new' });
+      // Teams novo encontrado, verifica registry para status (simplificado)
+      exec('reg query "HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Office\\Teams" /v PresenceState 2>nul', (regErr, regOut) => {
+        let status = 'available';
+        if (!regErr && regOut) {
+          if (regOut.includes('Busy') || regOut.includes('DoNotDisturb')) {
+            status = 'busy';
+          } else if (regOut.includes('InACall') || regOut.includes('InAMeeting')) {
+            status = 'in_meeting';
+          }
+        }
+        resolve({ running: true, status, type: 'new' });
+      });
     });
   });
 }
 
-// Função para verificar se aplicativos de reunião estão ativos
-async function isMeetingAppActive() {
+// Função NOVA: Verificar microfone em uso (indica reunião ativa)
+async function isMicrophoneInUse() {
   return new Promise((resolve) => {
-    exec('tasklist /fi "imagename eq teams.exe" && tasklist /fi "imagename eq ms-teams.exe" && tasklist /fi "imagename eq zoom.exe"', 
+    // Windows: verifica processos usando áudio
+    exec('powershell "Get-Counter \\"\\\\Process(*)\\\\% Processor Time\\" | Select-Object -ExpandProperty CounterSamples | Where-Object {$_.InstanceName -match \\"teams|zoom|chrome|msedge\\"} | Select-Object InstanceName"', 
     { timeout: 3000 }, (err, stdout) => {
       if (err) {
         resolve(false);
         return;
       }
-      const hasActiveApps = stdout.includes('teams.exe') || 
-                           stdout.includes('ms-teams.exe') || 
-                           stdout.includes('zoom.exe');
-      resolve(hasActiveApps);
+      // Se encontrar processos de reunião ativos, provável que mic esteja em uso
+      const hasActiveProcesses = stdout.includes('teams') || stdout.includes('zoom') || 
+                                stdout.includes('chrome') || stdout.includes('msedge');
+      resolve(hasActiveProcesses);
     });
   });
 }
 
-// Função para obter a janela ativa do sistema (simulada)
+// Obter janela ativa real (fallback para simulado se falhar)
 async function getActiveWindow() {
   const fn = getActiveWinFunction();
   if (fn) {
     try {
       const info = await fn();
-      
-      // Log para debug apenas quando há dados relevantes
-      if (info && info.title && info.owner && process.env.NODE_ENV === 'development') {
-        console.log('🔍 Active-win info:', JSON.stringify({
-          title: info.title.substring(0, 50) + '...',
-          owner: info.owner,
-          platform: process.platform
-        }, null, 2));
-      }
-      
-      if (info && info.title) {
-        // Retorna todas as informações disponíveis
-        return {
-          title: info.title,
-          owner: info.owner || { name: '', processName: '', pid: null },
-          bounds: info.bounds || {},
-          memoryUsage: info.memoryUsage || 0
-        };
-      }
+      if (info && info.title) return { title: info.title, processName: info.owner?.name || '' };
     } catch (e) {
       // Evita flood de logs: 1 a cada 10s
       if (Date.now() - lastActiveWinErrorAt > 10000) {
         console.warn('Falha active-win (desativando temporariamente):', e.message);
         lastActiveWinErrorAt = Date.now();
       }
-      return { title: '', owner: { name: '', processName: '', pid: null } };
+      return { title: '', processName: '' };
     }
   }
-  return { title: '', owner: { name: '', processName: '', pid: null } }; // sem detecção real disponível
+  return { title: '', processName: '' }; // sem detecção real disponível
 }
 
 // Função para verificar se uma janela é de reunião (melhorada)
@@ -255,172 +140,129 @@ function isMeetingWindow(windowTitle, processName = '', url = '') {
   const process = processName.toLowerCase();
   const urlLower = url.toLowerCase();
   
-  // Padrões mais específicos para evitar falsos positivos
-  const meetingPatterns = [
-    /google meet/i,
-    /microsoft teams.*meeting/i,
-    /zoom meeting/i,
-    /meet\.google\.com/i,
-    /teams\.microsoft\.com.*call/i,
-    /zoom\.us.*meeting/i,
-    /reunião.*teams/i,
-    /^teams.*reunião/i,
-    /^meet -/i,
-    /^zoom -/i
-  ];
-  
-  // Verifica se o título corresponde a padrões específicos de reunião
-  const matchesPattern = meetingPatterns.some(pattern => pattern.test(title));
-  
-  // Verifica URLs de reunião específicas
-  const meetingUrlPatterns = [
-    'meet.google.com/lookup/',
-    'meet.google.com/xxx-',
-    'teams.microsoft.com/l/meetup-join/',
-    'zoom.us/j/',
-    'us02web.zoom.us/j/'
-  ];
-  
-  const hasMeetingUrl = meetingUrlPatterns.some(pattern =>
-    urlLower.includes(pattern)
+  // Verifica keywords no título
+  const hasKeyword = MEETING_KEYWORDS.some(keyword =>
+    title.includes(keyword.toLowerCase())
   );
   
-  // Só considera reunião se houver padrão específico OU URL de reunião
-  return matchesPattern || hasMeetingUrl;
+  // Verifica URLs de reunião
+  const hasMeetingUrl = MEETING_URLs.some(meetingUrl =>
+    urlLower.includes(meetingUrl)
+  );
+  
+  // Verifica processos específicos + contexto
+  const isMeetingProcess = MEETING_PROCESSES.includes(process) && 
+    (hasKeyword || hasMeetingUrl || 
+     title.includes('reunião') || title.includes('meeting') || 
+     title.includes('chamada') || title.includes('call'));
+  
+  return hasKeyword || hasMeetingUrl || isMeetingProcess;
 }
 
-// Função para monitorar janelas ativas
-// Função principal de monitoramento refinada
+// Função para monitorar janelas ativas (APRIMORADA)
 async function monitorActiveWindows() {
   try {
-    const activeWindow = await getActiveWindow();
+    // 1. Verifica status do Teams primeiro
+    const teamsStatus = await detectTeamsPresence();
+    teamsPresenceStatus = teamsStatus.status;
     
-    if (!activeWindow || !activeWindow.title || activeWindow.title.trim() === '') {
-      // Se não há janela ou título, não logga para evitar spam
+    // Se Teams indica reunião ativa, dispara imediatamente
+    if (teamsStatus.status === 'in_meeting' || teamsStatus.status === 'busy') {
+      const meetingTitle = 'Microsoft Teams - Reunião em andamento';
+      if (!isInMeeting) {
+        console.log('Reunião detectada via Teams presence:', teamsStatus);
+        showMeetingNotification(meetingTitle);
+        isInMeeting = true;
+      }
       return;
     }
     
-    const detection = detectMeetingFromWindow(activeWindow);
+    // 2. Verifica janela ativa
+    const activeWindow = await getActiveWindow();
+    const title = (activeWindow && activeWindow.title) ? activeWindow.title.trim() : '';
+    const processName = activeWindow.processName || '';
     
-    // Log mais informativo apenas quando há dados relevantes
-    if (process.env.NODE_ENV === 'development') {
-      console.log(`🔍 Monitorando: ${detection.isMeeting ? '✅' : '❌'} "${activeWindow.owner?.name || 'unknown'}" - "${activeWindow.title.substring(0, 50)}..."`);
+    if (!title) {
+      isInMeeting = false;
+      return; // nada a avaliar
     }
-    
-    if (detection.isMeeting) {
-      // Gera uma chave única para esta reunião
-      const meetingKey = `${activeWindow.owner?.name || 'unknown'}-${activeWindow.title}`;
-      
-      // Verifica se já notificamos esta reunião
-      if (!notifiedMeetings.has(meetingKey)) {
-        console.log('🎯 REUNIÃO DETECTADA!');
-        console.log('📱 App:', detection.app);
-        console.log('📋 Título:', activeWindow.title);
-        console.log('💡 Razão:', detection.reason);
-        console.log('🔑 Chave:', meetingKey);
-        
-        // Registra que notificamos esta reunião
-        notifiedMeetings.set(meetingKey, {
-          timestamp: Date.now(),
-          app: detection.app,
-          title: activeWindow.title
-        });
-        
-        // Exibe notificação do sistema
-        showMeetingNotificationRefined(detection.app, activeWindow.title);
-        
-        // Limpa notificações antigas (mais de 30 minutos)
-        cleanOldNotifications();
-      } else {
-        console.log('🔄 Reunião já notificada:', detection.app);
+
+    // Atualiza candidato se título mudou
+    if (title !== candidateTitle) {
+      candidateTitle = title;
+      candidateSince = Date.now();
+      return; // aguarda estabilizar
+    }
+
+    // Verifica estabilidade
+    const stableFor = Date.now() - candidateSince;
+    if (stableFor < STABLE_THRESHOLD_MS) return; // ainda não estável
+
+    // Verifica se parece reunião
+    if (isMeetingWindow(title, processName)) {
+      if (!notifiedTitles.has(title) && !isInMeeting) {
+        console.log('Reunião detectada (janela estável):', title);
+        showMeetingNotification(title);
+        notifiedTitles.add(title);
+        isInMeeting = true;
+      }
+    } else {
+      // Se não é mais reunião, resetar estado
+      if (isInMeeting && !teamsStatus.running) {
+        isInMeeting = false;
       }
     }
-    
   } catch (error) {
-    console.error('❌ Erro no monitoramento:', error.message);
+    console.error('Erro ao monitorar janelas:', error);
   }
 }
 
-// Função para limpar notificações antigas
-function cleanOldNotifications() {
-  const thirtyMinutesAgo = Date.now() - (30 * 60 * 1000);
-  
-  for (const [key, data] of notifiedMeetings.entries()) {
-    if (data.timestamp < thirtyMinutesAgo) {
-      notifiedMeetings.delete(key);
-    }
-  }
-}
-
-// Função de notificação refinada conforme especificação
-function showMeetingNotificationRefined(app, windowTitle) {
+// Função para exibir notificação de reunião
+function showMeetingNotification(windowTitle) {
+  // Verifica se já não há uma notificação sendo exibida
   if (!Notification.isSupported()) {
-    console.log('⚠️ Notificações não são suportadas neste sistema');
+    console.log('Notificações não são suportadas neste sistema');
     return;
   }
 
   const notification = new Notification({
-    title: 'Reunião Detectada!',
-    body: `${app} - Clique para iniciar a gravação`,
+    title: 'Assistente de Reuniões IA',
+    body: 'Reunião detectada! Deseja iniciar a gravação?',
     icon: path.join(__dirname, 'public/favicon.ico'),
     actions: [
       {
         type: 'button',
-        text: '▶️ Iniciar Gravação'
+        text: 'Iniciar Gravaçãoooo'
+      },
+      {
+        type: 'button',
+        text: 'Ignorar'
       }
     ],
-    timeoutType: 'never', // Não remove automaticamente
+    urgency: 'normal',
+    timeoutType: 'default'
   });
 
-  // Evento quando a notificação é clicada
-  notification.on('click', () => {
-    console.log('🎬 Usuário clicou para iniciar gravação');
-    
-    // Foca a janela principal
-    if (mainWindow) {
-      mainWindow.focus();
-      mainWindow.show();
+  notification.on('action', (event, index) => {
+    if (index === 0) { // Iniciar Gravação
+      // Envia comando para a interface Vue.js
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('start-recording');
+        mainWindow.focus(); // Traz a janela para frente
+      }
     }
-    
-    // Envia evento IPC para a interface
-    if (mainWindow && mainWindow.webContents) {
-      mainWindow.webContents.send('start-recording-from-main', {
-        app,
-        title: windowTitle,
-        timestamp: new Date().toISOString()
-      });
-    }
-    
     notification.close();
   });
 
-  // Evento quando o botão de ação é clicado
-  notification.on('action', (index) => {
-    if (index === 0) { // Botão "Iniciar Gravação"
-      console.log('🎬 Usuário clicou no botão de iniciar gravação');
-      
-      // Foca a janela principal
-      if (mainWindow) {
-        mainWindow.focus();
-        mainWindow.show();
-      }
-      
-      // Envia evento IPC para a interface
-      if (mainWindow && mainWindow.webContents) {
-        mainWindow.webContents.send('start-recording-from-main', {
-          app,
-          title: windowTitle,
-          timestamp: new Date().toISOString()
-        });
-      }
+  notification.on('click', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.focus();
     }
-    
     notification.close();
   });
 
   notification.show();
-  
-  console.log(`📢 Notificação exibida para: ${app}`);
+  showOverlayReminder(windowTitle);
 }
 
 function showOverlayReminder(meetingTitle) {
@@ -501,8 +343,8 @@ ipcMain.on('overlay-start-recording', () => {
 // Função para iniciar o monitoramento
 function startMeetingMonitoring() {
   if (!meetingMonitorInterval) {
-    console.log('Iniciando monitoramento de reuniões (detecção real)...');
-    meetingMonitorInterval = setInterval(monitorActiveWindows, MEETING_DETECTION_INTERVAL); // 7 segundos conforme especificação
+    console.log('Iniciando monitoramento INTELIGENTE de reuniões...');
+    meetingMonitorInterval = setInterval(monitorActiveWindows, 3000); // um pouco mais responsivo
   }
 }
 
@@ -590,40 +432,9 @@ ipcMain.handle('open-external', (event, url) => {
   shell.openExternal(url);
 });
 
-// Handler para debug da detecção de reuniões (atualizado)
-ipcMain.handle('get-meeting-debug', async () => {
-  try {
-    const activeWindow = await getActiveWindow();
-    
-    let debugInfo = {
-      activeWindow: {
-        title: activeWindow?.title || 'Nenhuma',
-        owner: activeWindow?.owner?.name || activeWindow?.owner?.processName || 'unknown',
-        pid: activeWindow?.owner?.pid || 'unknown',
-        bounds: activeWindow?.bounds || 'unknown'
-      },
-      notifiedMeetings: Array.from(notifiedMeetings.keys()),
-      totalNotifications: notifiedMeetings.size,
-      monitoringActive: !!meetingMonitorInterval
-    };
-    
-    if (activeWindow) {
-      const detection = detectMeetingFromWindow(activeWindow);
-      debugInfo.detection = detection;
-    }
-    
-    return debugInfo;
-  } catch (error) {
-    return { error: error.message };
-  }
-});
-
 // Este método será chamado quando o Electron tiver finalizado
 // a inicialização e estiver pronto para criar janelas do navegador.
-app.whenReady().then(async () => {
-  // Inicializa active-win primeiro
-  await initActiveWin();
-  
+app.whenReady().then(() => {
   // Tratamento de permissões (microfone / câmera)
   try {
     const ses = session.defaultSession;
