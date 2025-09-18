@@ -1,5 +1,5 @@
 // preload.js
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, desktopCapturer } = require('electron');
 
 // Expõe APIs seguras para a interface Vue.js
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -42,8 +42,30 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return ipcRenderer.invoke('get-meeting-debug');
   },
 
+
   // Informações da plataforma
-  platform: process.platform
+  platform: process.platform,
+
+  // Injetar dados de reunião no localStorage
+  injectMeetingData: (meetingData) => ipcRenderer.invoke('inject-meeting-data', meetingData),
+
+  // Desktop Capturer para captura de áudio do sistema
+  getDesktopCapturer: async (types = ['screen', 'window']) => {
+    try {
+      if (!desktopCapturer) {
+        throw new Error('desktopCapturer não disponível');
+      }
+      const sources = await desktopCapturer.getSources({
+        types: types,
+        thumbnailSize: { width: 150, height: 150 },
+        fetchWindowIcons: false
+      });
+      return sources;
+    } catch (error) {
+      console.error('Erro ao obter fontes de captura:', error);
+      return []; // Retorna array vazio em vez de throw para não quebrar o app
+    }
+  }
 });
 
 console.log('Script de pré-carregamento executado! API exposta:', Object.keys(window.electronAPI || {}));

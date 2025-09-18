@@ -432,6 +432,52 @@ ipcMain.handle('open-external', (event, url) => {
   shell.openExternal(url);
 });
 
+
+// Handler para debug de reuniões (corrige o erro no Sidebar)
+ipcMain.handle('get-meeting-debug', () => {
+  return {
+    detectionActive: !!meetingMonitorInterval,
+    lastMeetingTitle: lastMeetingTitle || 'Nenhuma',
+    teamsStatus: teamsPresenceStatus || 'unknown',
+    monitoringInterval: meetingMonitorInterval ? 3000 : 0,
+    isInMeeting: isInMeeting || false
+  };
+});
+
+// Handler para injetar dados de reunião diretamente no localStorage
+ipcMain.handle('inject-meeting-data', async (event, meetingData) => {
+  try {
+    // Envia comando para a página principal executar a injeção
+    mainWindow.webContents.executeJavaScript(`
+      try {
+        // Pega as reuniões existentes
+        const existingMeetings = JSON.parse(localStorage.getItem("assistente-reunioes-history") || "[]");
+        
+        // Adiciona a nova reunião no início da lista
+        existingMeetings.unshift(${JSON.stringify(meetingData)});
+        
+        // Salva de volta no localStorage
+        localStorage.setItem("assistente-reunioes-history", JSON.stringify(existingMeetings));
+        
+        console.log("✅ Reunião adicionada com sucesso!");
+        console.log("Total de reuniões:", existingMeetings.length);
+        
+        // Retorna sucesso
+        true;
+      } catch (error) {
+        console.error("❌ Erro ao adicionar reunião:", error);
+        false;
+      }
+    `);
+    
+    return { success: true };
+  } catch (error) {
+    console.error('❌ Erro ao injetar dados:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+
 // Este método será chamado quando o Electron tiver finalizado
 // a inicialização e estiver pronto para criar janelas do navegador.
 app.whenReady().then(() => {

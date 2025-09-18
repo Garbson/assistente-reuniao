@@ -1,6 +1,7 @@
 import { onMounted, onUnmounted, ref } from 'vue';
+import { OpenAITranscription } from '../utils/openaiTranscription.js';
 
-// Composable LIMPO e simplificado: grava áudio (MediaRecorder) e envia para Gemini para transcrever + resumir
+// Composable OTIMIZADO: grava áudio do sistema + microfone e usa OpenAI Whisper + Gemini para transcrever e resumir
 export function useRecorder() {
   const isRecording = ref(false);
   const isProcessing = ref(false);
@@ -9,11 +10,18 @@ export function useRecorder() {
   const isSupported = ref(false);
   const hasAudio = ref(false);
   const audioBlob = ref(null);
+  
 
   let mediaRecorder = null;
   let audioChunks = [];
   let startTime = null;
   let removeElectronListener = null;
+  // Configurações de API - usando apenas variáveis de ambiente
+  const GEMINI_API_KEY = import.meta.env.VITE_GOOGLE_API_KEY;
+  let OPENAI_API_KEY = localStorage.getItem('openai_api_key') || '';
+  let OPENAI_ORG_ID = localStorage.getItem('openai_org_id') || null;
+
+  let openaiTranscription = null;
 
   const checkSupport = () => {
     isSupported.value = !!(navigator.mediaDevices && window.MediaRecorder);
@@ -25,30 +33,89 @@ export function useRecorder() {
     if (!checkSupport()) return;
     if (isRecording.value) return;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      let stream = null;
+
+      // Tenta capturar áudio do sistema primeiro (para reuniões)
+      if (window.electronAPI && window.electronAPI.getDesktopCapturer) {
+        try {
+          console.log('🎤 Tentando capturar áudio do sistema para reuniões...');
+
+          // Obtém fontes de captura de tela
+          const sources = await window.electronAPI.getDesktopCapturer(['screen', 'window']);
+
+          if (sources && sources.length > 0) {
+            // Usa a primeira fonte disponível com áudio do sistema
+            stream = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                mandatory: {
+                  chromeMediaSource: 'desktop',
+                  chromeMediaSourceId: sources[0].id
+                }
+              },
+              video: false
+            });
+
+            console.log('✅ Captura de áudio do sistema ativada');
+          }
+        } catch (systemError) {
+          console.warn('⚠️ Falha na captura do sistema, usando microfone:', systemError.message);
+        }
+      }
+
+      // Fallback: captura apenas microfone se não conseguir áudio do sistema
+      if (!stream) {
+        console.log('🎤 Usando captura de microfone padrão');
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 44100 // Alta qualidade para melhor transcrição
+          }
+        });
+      }
+
       const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
         ? 'audio/webm;codecs=opus'
         : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg');
-      mediaRecorder = new MediaRecorder(stream, { mimeType });
+
+      mediaRecorder = new MediaRecorder(stream, {
+        mimeType,
+        audioBitsPerSecond: 128000 // Alta qualidade para melhor transcrição
+      });
+
       audioChunks = [];
       transcript.value = '';
       audioBlob.value = null;
       hasAudio.value = false;
       error.value = null;
       startTime = new Date();
-      mediaRecorder.ondataavailable = e => { if (e.data && e.data.size > 0) audioChunks.push(e.data); };
+
+      mediaRecorder.ondataavailable = e => {
+        if (e.data && e.data.size > 0) audioChunks.push(e.data);
+      };
+
       mediaRecorder.onstop = () => {
         audioBlob.value = new Blob(audioChunks, { type: mimeType });
         hasAudio.value = true;
         isRecording.value = false;
         stream.getTracks().forEach(t => t.stop());
       };
+
       mediaRecorder.start(500);
       isRecording.value = true;
+
+      console.log(`🔴 Gravação iniciada com ${stream.getAudioTracks()[0].label}`);
+
     } catch (e) {
-      if (e.name === 'NotAllowedError') error.value = 'Permissão de microfone negada.';
-      else if (e.name === 'NotFoundError') error.value = 'Nenhum microfone encontrado.';
-      else error.value = 'Erro ao iniciar gravação.';
+      console.error('❌ Erro na gravação:', e);
+      if (e.name === 'NotAllowedError') {
+        error.value = 'Permissão de áudio negada. Para capturar reuniões, permita acesso ao áudio.';
+      } else if (e.name === 'NotFoundError') {
+        error.value = 'Nenhum dispositivo de áudio encontrado.';
+      } else {
+        error.value = `Erro ao iniciar gravação: ${e.message}`;
+      }
     }
   };
 
@@ -70,44 +137,109 @@ export function useRecorder() {
     if (!audioBlob.value) throw new Error('Nenhum áudio disponível.');
     isProcessing.value = true;
     error.value = null;
+    
     try {
-      const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
-      if (!apiKey) throw new Error('Chave da API ausente (.env).');
-      
       const fileSizeMB = audioBlob.value.size / (1024 * 1024);
       const durationMinutes = getRecordingDuration() / 60;
       
-      console.log(`📊 Áudio: ${fileSizeMB.toFixed(1)}MB, ${durationMinutes.toFixed(1)} minutos`);
+      console.log(`🎵 Processando áudio: ${fileSizeMB.toFixed(1)}MB, ${durationMinutes.toFixed(1)} minutos`);
+
+      // Usa OpenAI Whisper como método principal
+      if (OPENAI_API_KEY) {
+        try {
+          // Inicializa OpenAI se necessário
+          if (!openaiTranscription) {
+            openaiTranscription = new OpenAITranscription();
+            await openaiTranscription.initialize(OPENAI_API_KEY, OPENAI_ORG_ID);
+          }
+
+          console.log('🚀 Usando OpenAI Whisper (oficial)');
+
+          // Para arquivos grandes, usa chunking otimizado do Whisper
+          if (fileSizeMB > 20 || durationMinutes > 25) {
+            console.log('📦 Arquivo grande detectado, processando em chunks otimizados...');
+            return await transcribeAudioInChunksWhisper();
+          }
+
+          // Para arquivos menores, usa método direto
+          const transcriptText = await openaiTranscription.transcribe(audioBlob.value, {
+            model: 'whisper-1',
+            language: 'pt',
+            temperature: 0.0,
+            prompt: 'Esta é uma transcrição de uma reunião corporativa em português brasileiro. Incluir nomes próprios, termos técnicos e evitar palavras de preenchimento.'
+          });
+
+          transcript.value = transcriptText;
+          console.log('✅ Transcrição OpenAI concluída!');
+          return transcriptText;
+
+        } catch (openaiError) {
+          console.warn('⚠️ Falha no OpenAI, tentando Gemini como fallback:', openaiError.message);
+
+          // Tratamento específico para diferentes erros de API
+          if (openaiError.message.includes('quota') || openaiError.message.includes('insufficient_quota')) {
+            error.value = 'Cota da API OpenAI excedida. Configure uma nova chave ou tente mais tarde.';
+          } else if (openaiError.message.includes('API key')) {
+            error.value = 'Chave da API OpenAI inválida. Verifique sua configuração.';
+          } else if (openaiError.message.includes('rate')) {
+            error.value = 'Limite de rate da OpenAI excedido. Aguarde alguns minutos.';
+          }
+
+          // Continua para Gemini como fallback
+        }
+      }
       
-      // Para reuniões longas (> 15MB), processar em chunks
-      if (fileSizeMB > 15) {
+      // Fallback: Usa Gemini se Groq falhar ou não estiver configurado
+      console.log('📱 Usando Gemini como fallback...');
+      
+      // Para arquivos muito grandes, usa chunks
+      if (fileSizeMB > 10 || durationMinutes > 15) {
+        console.log('📦 Arquivo grande detectado, processando em chunks...');
         return await transcribeAudioInChunks();
       }
       
-      // Para arquivos menores, usar método inline
+      // Para arquivos menores, usa método direto com Gemini
       const base64Audio = await blobToBase64(audioBlob.value);
-      const prompt = `Você receberá o áudio BRUTO de uma reunião corporativa. Faça apenas a transcrição completa e fiel em português do Brasil, corrigindo erros de dicção óbvios e removendo muletas ("éé", "ahn", "tipo"). Mantenha todos os nomes citados. Retorne apenas o texto transcrito, sem formatação adicional ou comentários.`;
+      const prompt = `Você receberá o áudio de uma reunião corporativa. Faça apenas a transcrição completa e fiel em português do Brasil, corrigindo erros de dicção óbvios e removendo muletas ("éé", "ahn", "tipo"). Mantenha todos os nomes citados. Retorne apenas o texto transcrito, sem formatação adicional ou comentários.`;
       
-      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          contents: [{ parts: [ { text: prompt }, { inline_data: { mime_type: audioBlob.value.type || 'audio/webm', data: base64Audio } } ] }],
+          contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: audioBlob.value.type || 'audio/webm', data: base64Audio } }] }],
           generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
         })
       });
-      if (!resp.ok) {
-        const errorText = await resp.text();
-        console.error('❌ Erro da API:', errorText);
-        throw new Error(`Erro da API (${resp.status}): ${errorText}`);
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Erro Gemini:', errorText);
+
+        // Tratamento específico para erros do Gemini
+        if (response.status === 400 && errorText.includes('API key not valid')) {
+          throw new Error('Chave da API Google (Gemini) inválida. Verifique sua configuração no .env');
+        } else if (response.status === 429) {
+          throw new Error('Limite de rate do Gemini excedido. Tente novamente em alguns minutos.');
+        } else if (response.status === 403) {
+          throw new Error('Acesso negado à API Gemini. Verifique as permissões da sua chave.');
+        } else {
+          throw new Error(`Falha na transcrição Gemini: ${response.status} - ${errorText}`);
+        }
       }
-      const data = await resp.json();
-      const transcriptText = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('\n') || '';
-      if (!transcriptText) throw new Error('Transcrição vazia retornada da API.');
+      
+      const result = await response.json();
+      const transcriptText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+      
+      if (!transcriptText || !transcriptText.trim()) {
+        throw new Error('Transcrição vazia retornada.');
+      }
       
       transcript.value = transcriptText;
+      console.log('✅ Transcrição Gemini concluída');
       return transcriptText;
+      
     } catch (e) {
+      console.error('❌ Erro na transcrição:', e);
       error.value = e.message;
       throw e;
     } finally {
@@ -115,8 +247,88 @@ export function useRecorder() {
     }
   };
 
+  // Nova função de chunking otimizada para Whisper
+  const transcribeAudioInChunksWhisper = async () => {
+    try {
+      console.log('🔄 Processando áudio longo com chunks otimizados para Whisper...');
+
+      // Chunks de 30 segundos conforme recomendação do Whisper
+      const CHUNK_DURATION_SECONDS = 30;
+      const OVERLAP_SECONDS = 2; // Overlap para evitar cortes no meio de palavras
+
+      const chunks = await splitAudioIntoOptimizedChunks(audioBlob.value, CHUNK_DURATION_SECONDS, OVERLAP_SECONDS);
+      console.log(`📦 Dividido em ${chunks.length} chunks de 30s com overlap`);
+
+      let fullTranscript = '';
+      const previousContext = ''; // Para manter contexto entre chunks
+
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const chunkSizeMB = chunk.size / (1024 * 1024);
+
+        console.log(`📤 Processando chunk ${i + 1}/${chunks.length} (${chunkSizeMB.toFixed(1)}MB)`);
+
+        try {
+          // Prompt contextual para manter continuidade
+          const contextualPrompt = i === 0
+            ? 'Esta é uma transcrição de uma reunião corporativa em português brasileiro. Incluir nomes próprios, termos técnicos e evitar palavras de preenchimento.'
+            : `Continuação da reunião. Contexto anterior: "${previousContext}". Manter consistência de nomes e termos.`;
+
+          const chunkTranscript = await openaiTranscription.transcribe(chunk, {
+            model: 'whisper-1',
+            language: 'pt',
+            temperature: 0.0,
+            prompt: contextualPrompt
+          });
+
+          // Remove overlap duplicado (primeiras palavras se é chunk > 0)
+          let processedTranscript = chunkTranscript.trim();
+          if (i > 0 && fullTranscript) {
+            // Tenta remover sobreposição simples
+            const lastWords = fullTranscript.split(' ').slice(-5).join(' ');
+            const firstWords = processedTranscript.split(' ').slice(0, 5).join(' ');
+
+            // Se há similaridade, remove as primeiras palavras do chunk atual
+            if (lastWords.toLowerCase().includes(firstWords.toLowerCase().substring(0, 20))) {
+              processedTranscript = processedTranscript.split(' ').slice(3).join(' ');
+            }
+          }
+
+          if (fullTranscript && processedTranscript.trim()) {
+            fullTranscript += ' ';
+          }
+          fullTranscript += processedTranscript.trim();
+
+          // Atualiza contexto para próximo chunk (últimas palavras)
+          previousContext = fullTranscript.split(' ').slice(-10).join(' ');
+
+          // Pequena pausa para evitar rate limiting
+          if (i < chunks.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+
+        } catch (chunkError) {
+          console.error(`❌ Erro no chunk ${i + 1}:`, chunkError);
+          fullTranscript += ` [Erro na transcrição do segmento ${i + 1}] `;
+        }
+      }
+
+      if (!fullTranscript.trim()) {
+        throw new Error('Nenhuma transcrição foi obtida dos chunks.');
+      }
+
+      transcript.value = fullTranscript;
+      console.log('✅ Transcrição em chunks finalizada');
+      return fullTranscript;
+
+    } catch (e) {
+      console.error('❌ Erro ao processar áudio em chunks:', e);
+      throw new Error(`Erro ao processar áudio longo: ${e.message}`);
+    }
+  };
+
   const transcribeAudioInChunks = async () => {
-    const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
+    const apiKey = GEMINI_API_KEY;
     const CHUNK_DURATION_MS = 10 * 60 * 1000; // 10 minutos por chunk
     
     try {
@@ -254,6 +466,58 @@ export function useRecorder() {
     }
   };
 
+  // Função otimizada para dividir áudio em chunks de 30s com overlap
+  const splitAudioIntoOptimizedChunks = async (audioBlob, chunkDurationSeconds, overlapSeconds) => {
+    const chunks = [];
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    const audioContext = new AudioContextClass();
+
+    try {
+      // Decodifica o áudio para obter informações precisas
+      const arrayBuffer = await audioBlob.arrayBuffer();
+      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice());
+
+      const totalDurationSeconds = audioBuffer.duration;
+      const chunkDurationMs = chunkDurationSeconds * 1000;
+      const overlapMs = overlapSeconds * 1000;
+      const effectiveChunkDuration = chunkDurationSeconds - overlapSeconds;
+
+      const numChunks = Math.ceil(totalDurationSeconds / effectiveChunkDuration);
+
+      console.log(`🎵 Áudio total: ${(totalDurationSeconds / 60).toFixed(1)} min, dividindo em ${numChunks} chunks de ${chunkDurationSeconds}s`);
+
+      // Calcula bytes por segundo para divisão aproximada
+      const bytesPerSecond = audioBlob.size / totalDurationSeconds;
+
+      for (let i = 0; i < numChunks; i++) {
+        const startTimeSeconds = i * effectiveChunkDuration;
+        const endTimeSeconds = Math.min(startTimeSeconds + chunkDurationSeconds, totalDurationSeconds);
+
+        const startByte = Math.floor(startTimeSeconds * bytesPerSecond);
+        const endByte = Math.floor(endTimeSeconds * bytesPerSecond);
+
+        const chunkBlob = audioBlob.slice(startByte, endByte, audioBlob.type);
+        chunks.push(chunkBlob);
+
+        console.log(`📦 Chunk ${i + 1}: ${startTimeSeconds.toFixed(1)}-${endTimeSeconds.toFixed(1)}s (${(chunkBlob.size/1024/1024).toFixed(1)}MB)`);
+      }
+
+      return chunks;
+
+    } catch (e) {
+      console.error('❌ Erro ao dividir áudio em chunks otimizados:', e);
+      // Fallback: usa divisão simples por tamanho
+      const simpleChunkSize = Math.ceil(audioBlob.size / Math.ceil(audioBlob.size / (20 * 1024 * 1024))); // ~20MB por chunk
+      const chunks = [];
+      for (let i = 0; i < audioBlob.size; i += simpleChunkSize) {
+        chunks.push(audioBlob.slice(i, i + simpleChunkSize, audioBlob.type));
+      }
+      return chunks;
+    } finally {
+      audioContext.close();
+    }
+  };
+
   const splitAudioIntoChunks = async (audioBlob, chunkDurationMs) => {
     const chunks = [];
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -324,7 +588,7 @@ export function useRecorder() {
       const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
       if (!apiKey) throw new Error('Chave da API ausente (.env).');
       
-      const prompt = `Você receberá a transcrição de uma reunião corporativa. Produza APENAS o JSON final (sem markdown, sem comentários) seguindo as regras abaixo rigorosamente.\n\nOBJETIVO: Resumo executivo elegante + tópicos claros + tarefas acionáveis a partir da transcrição fornecida.\n\nREGRAS:\n1. geral: 2 a 4 frases fluidas cobrindo Contexto, Objetivo(s), Decisões (se houver) e Próximos Passos estratégicos. Estilo profissional, positivo e claro.\n2. pontos_discutidos: até 12 itens. Cada item: frase curta iniciando com verbo no infinitivo OU substantivo forte (ex: "Definir cronograma de testes", "Alinhamento de orçamento"). Sem redundâncias; agrupar ideias semelhantes.\n3. tarefas: até 8 ações objetivas. Cada tarefa: { descricao: verbo no infinitivo + objeto claro; responsavel: nome mencionado ou "A definir" se ausente; concluida: false }. NÃO inventar nomes. Não duplicar tarefas de significado similar.\n4. Se não houver dados suficientes para pontos_discutidos ou tarefas, usar array vazio [].\n5. NUNCA adicionar campos extras ou texto fora do JSON.\n\nFORMATO EXATO DO RETORNO (JSON ÚNICO):\n{\n  "geral": "...",\n  "pontos_discutidos": ["..."],\n  "tarefas": [ { "descricao": "...", "responsavel": "...", "concluida": false } ]\n}\n\nTranscrição da reunião:\n${transcript.value}\n\nRetorne somente o JSON.`;
+      const prompt = `Você receberá a transcrição de uma reunião corporativa. Produza APENAS o JSON final (sem markdown, sem comentários) seguindo as regras abaixo rigorosamente.\n\nOBJETIVO: Gerar uma ATA DE REUNIÃO completa e detalhada com TODOS os pontos importantes discutidos.\n\nREGRAS:\n1. contexto: Breve contexto da reunião (1-2 frases sobre o propósito/tema principal).\n2. participantes: Array com TODOS os nomes mencionados na reunião. Se não houver nomes específicos, usar ["Participantes não identificados"].\n3. pontos_discutidos: TODOS os tópicos abordados na reunião, por ordem cronológica. Seja detalhado e completo. Cada item deve ser uma frase clara descrevendo o que foi discutido.\n4. decisoes_tomadas: Array com TODAS as decisões concretas tomadas durante a reunião. Se nenhuma decisão foi tomada, usar array vazio [].\n5. tarefas_e_acoes: TODAS as ações mencionadas, com responsável quando identificado. Formato: { "descricao": "ação específica", "responsavel": "nome ou 'A definir'", "prazo": "prazo mencionado ou 'Não definido'", "concluida": false }\n6. proximos_passos: Array com os próximos passos estratégicos mencionados.\n7. observacoes: Informações adicionais relevantes, dúvidas levantadas, ou pontos que ficaram pendentes.\n\nFORMATO EXATO DO RETORNO (JSON ÚNICO):\n{\n  "contexto": "...",\n  "participantes": ["..."],\n  "pontos_discutidos": ["..."],\n  "decisoes_tomadas": ["..."],\n  "tarefas_e_acoes": [{"descricao": "...", "responsavel": "...", "prazo": "...", "concluida": false}],\n  "proximos_passos": ["..."],\n  "observacoes": ["..."]\n}\n\nTranscrição da reunião:\n${transcript.value}\n\nRetorne somente o JSON completo e detalhado.`;
       
       const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
         method: 'POST',
@@ -342,12 +606,16 @@ export function useRecorder() {
       const parsed = JSON.parse(match[0]);
       
       return {
-        geral: parsed.geral || '',
+        contexto: parsed.contexto || '',
+        participantes: parsed.participantes || ['Participantes não identificados'],
         pontos_discutidos: parsed.pontos_discutidos || [],
-        tarefas: parsed.tarefas || [],
+        decisoes_tomadas: parsed.decisoes_tomadas || [],
+        tarefas_e_acoes: parsed.tarefas_e_acoes || [],
+        proximos_passos: parsed.proximos_passos || [],
+        observacoes: parsed.observacoes || [],
         data_reuniao: new Date().toISOString(),
-        duracao_minutos: getRecordingDuration() / 60,
-        fonte: 'Google Gemini API (transcrição)'
+        duracao_minutos: Math.round(getRecordingDuration() / 60 * 10) / 10,
+        fonte: 'Transcrição via Whisper + Análise via Gemini'
       };
     } catch (e) {
       error.value = e.message;
@@ -357,12 +625,60 @@ export function useRecorder() {
     }
   };
 
+
   const setupElectronListener = () => {
     if (window.electronAPI && window.electronAPI.onStartRecording) {
       removeElectronListener = window.electronAPI.onStartRecording(() => {
         if (!isRecording.value) startRecording();
       });
     }
+  };
+
+
+  // Função para configurar a API key do OpenAI
+  const setOpenAIApiKey = (apiKey, organizationId = null) => {
+    if (apiKey && apiKey.trim()) {
+      OPENAI_API_KEY = apiKey.trim();
+      OPENAI_ORG_ID = organizationId;
+
+      // Reset da instância para forçar reinicialização
+      openaiTranscription = null;
+
+      console.log('🔑 OpenAI API Key configurada');
+      return true;
+    }
+    OPENAI_API_KEY = '';
+    OPENAI_ORG_ID = null;
+    openaiTranscription = null;
+    return false;
+  };
+
+  // Função para testar conexão OpenAI
+  const testOpenAIConnection = async (apiKey, organizationId = null) => {
+    try {
+      const testOpenAI = new OpenAITranscription();
+      await testOpenAI.initialize(apiKey, organizationId);
+      return await testOpenAI.testConnection();
+    } catch (error) {
+      console.error('❌ Teste OpenAI falhou:', error);
+      return false;
+    }
+  };
+
+  // Função para estimar custo (apenas OpenAI Whisper)
+  const estimateTranscriptionCost = (durationMinutes) => {
+    if (openaiTranscription) {
+      return openaiTranscription.estimateCost(durationMinutes);
+    }
+    // Estimativa manual se a instância não estiver disponível
+    const costUSD = durationMinutes * 0.006;
+    return {
+      model: 'whisper-1',
+      durationMinutes,
+      durationHours: (durationMinutes / 60).toFixed(2),
+      costUSD: costUSD.toFixed(4),
+      costBRL: (costUSD * 5.5).toFixed(2)
+    };
   };
 
   onMounted(() => {
@@ -388,7 +704,12 @@ export function useRecorder() {
     clearTranscript,
     transcribeAudio,
     generateSummaryFromTranscript,
-    getRecordingDuration
+    getRecordingDuration,
+    transcribeAudioInChunks,
+    setOpenAIApiKey,
+    testOpenAIConnection,
+    estimateTranscriptionCost,
+    hasOpenAIConfigured: () => !!OPENAI_API_KEY
   };
 }
 
