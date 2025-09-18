@@ -19,6 +19,12 @@
               isRecording ? formatDuration(recordingDuration) : 'Parado'
             "
           />
+          <AudioCaptureIndicator
+            v-if="isRecording || audioCaptureType !== 'unknown'"
+            :capture-type="audioCaptureType"
+            :is-capturing-full-meeting="isCapturingFullMeeting"
+            :source-count="audioSources.length"
+          />
           <RecordingControls
             :is-recording="isRecording"
             :is-supported="isSupported"
@@ -34,14 +40,6 @@
 
     <!-- Conteúdo principal -->
     <div class="flex-1 overflow-y-auto p-6">
-      <!-- OpenAI Configuration -->
-      <OpenAIConfig
-        :has-open-a-i-configured="hasOpenAIConfigured()"
-        :on-configure-open-a-i="setOpenAIApiKey"
-        :on-test-connection="testOpenAIConnection"
-        @configured="onOpenAIConfigured"
-        @reset="onOpenAIReset"
-      />
 
 
       <!-- Alerts -->
@@ -57,6 +55,14 @@
         type="warning"
         title="Captura não suportada"
         message="Nenhuma API de áudio está disponível. Verifique permissões do sistema e reinicie o aplicativo."
+      />
+
+      <!-- Alerta sobre captura limitada -->
+      <AlertBox
+        v-if="audioCaptureType === 'microphone' && isRecording"
+        type="warning"
+        title="⚠️ Captura limitada"
+        message="Gravando apenas seu áudio. Para capturar todos os participantes, configure captura de áudio do sistema ou use um dispositivo de áudio virtual."
       />
 
       <!-- Status da API - Simplificado -->
@@ -109,7 +115,7 @@ import PostRecordingActions from "./recorder/PostRecordingActions.vue";
 import RecordingControls from "./recorder/RecordingControls.vue";
 import TranscriptDisplay from "./recorder/TranscriptDisplay.vue";
 import AlertBox from "./ui/AlertBox.vue";
-import OpenAIConfig from "./ui/OpenAIConfig.vue";
+import AudioCaptureIndicator from "./ui/AudioCaptureIndicator.vue";
 import StatusIndicator from "./ui/StatusIndicator.vue";
 
 // Emits
@@ -133,6 +139,10 @@ const {
   testOpenAIConnection,
   estimateTranscriptionCost,
   hasOpenAIConfigured,
+  // Novos: estado da captura de áudio
+  audioCaptureType,
+  isCapturingFullMeeting,
+  audioSources,
 } = useRecorder();
 
 const { saveMeeting } = useHistory();
@@ -296,14 +306,6 @@ const saveWithoutSummary = () => {
   }
 };
 
-// OpenAI configuration handlers
-const onOpenAIConfigured = () => {
-  console.log('✅ OpenAI configurado com sucesso');
-};
-
-const onOpenAIReset = () => {
-  console.log('🔄 OpenAI resetado');
-};
 
 // Watchers
 watch(isRecording, (newValue) => {

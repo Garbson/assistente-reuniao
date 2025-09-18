@@ -10,15 +10,20 @@ export function useRecorder() {
   const isSupported = ref(false);
   const hasAudio = ref(false);
   const audioBlob = ref(null);
+
+  // Estado da captura de áudio
+  const audioCaptureType = ref('unknown'); // 'system', 'microphone', 'unknown'
+  const isCapturingFullMeeting = ref(false); // true se capturando áudio de todos
+  const audioSources = ref([]); // fontes disponíveis
   
 
   let mediaRecorder = null;
   let audioChunks = [];
   let startTime = null;
   let removeElectronListener = null;
-  // Configurações de API - usando apenas variáveis de ambiente
+  // Configurações de API - Whisper como prioridade
   const GEMINI_API_KEY = import.meta.env.VITE_GOOGLE_API_KEY;
-  let OPENAI_API_KEY = localStorage.getItem('openai_api_key') || '';
+  let OPENAI_API_KEY = import.meta.env.VITE_OPENAI_API_KEY || localStorage.getItem('openai_api_key') || '';
   let OPENAI_ORG_ID = localStorage.getItem('openai_org_id') || null;
 
   let openaiTranscription = null;
@@ -42,6 +47,7 @@ export function useRecorder() {
 
           // Obtém fontes de captura de tela
           const sources = await window.electronAPI.getDesktopCapturer(['screen', 'window']);
+          audioSources.value = sources || [];
 
           if (sources && sources.length > 0) {
             // Usa a primeira fonte disponível com áudio do sistema
@@ -55,7 +61,10 @@ export function useRecorder() {
               video: false
             });
 
-            console.log('✅ Captura de áudio do sistema ativada');
+            // Configura estado para captura do sistema
+            audioCaptureType.value = 'system';
+            isCapturingFullMeeting.value = true;
+            console.log('✅ Captura de áudio do sistema ativada - ÁUDIO COMPLETO DA REUNIÃO');
           }
         } catch (systemError) {
           console.warn('⚠️ Falha na captura do sistema, usando microfone:', systemError.message);
@@ -75,6 +84,11 @@ export function useRecorder() {
             sampleRate: 44100 // Alta qualidade para melhor transcrição
           }
         });
+
+        // Configura estado para apenas microfone
+        audioCaptureType.value = 'microphone';
+        isCapturingFullMeeting.value = false;
+        console.log('⚠️ CAPTURANDO APENAS SEU ÁUDIO - outros participantes não serão transcritos');
       }
 
       const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
@@ -102,6 +116,8 @@ export function useRecorder() {
         hasAudio.value = true;
         isRecording.value = false;
         stream.getTracks().forEach(t => t.stop());
+        // Reset do estado de captura
+        resetCaptureState();
       };
 
       mediaRecorder.start(500);
@@ -683,6 +699,13 @@ export function useRecorder() {
     };
   };
 
+  // Função para resetar estado de captura
+  const resetCaptureState = () => {
+    audioCaptureType.value = 'unknown';
+    isCapturingFullMeeting.value = false;
+    audioSources.value = [];
+  };
+
   onMounted(() => {
     checkSupport();
     setupElectronListener();
@@ -701,6 +724,11 @@ export function useRecorder() {
     error,
     hasAudio,
     audioBlob,
+    // Estado da captura de áudio
+    audioCaptureType,
+    isCapturingFullMeeting,
+    audioSources,
+    // Funções
     startRecording,
     stopRecording,
     clearTranscript,
