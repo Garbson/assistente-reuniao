@@ -6,16 +6,20 @@
         <div>
           <h2 class="text-xl font-semibold text-gray-900">Nova Reunião</h2>
           <p class="text-sm text-gray-500 mt-1">
-            {{ isRecording ? "Gravação em andamento..." : "Pronto para gravar" }}
+            {{
+              isRecording ? "Gravação em andamento..." : "Pronto para gravar"
+            }}
           </p>
         </div>
 
         <div class="flex items-center space-x-3">
-          <StatusIndicator 
-            :is-active="isRecording" 
-            :status-text="isRecording ? formatDuration(recordingDuration) : 'Parado'" 
+          <StatusIndicator
+            :is-active="isRecording"
+            :status-text="
+              isRecording ? formatDuration(recordingDuration) : 'Parado'
+            "
           />
-          <RecordingControls 
+          <RecordingControls
             :is-recording="isRecording"
             :is-supported="isSupported"
             :is-processing="isProcessing"
@@ -30,6 +34,16 @@
 
     <!-- Conteúdo principal -->
     <div class="flex-1 overflow-y-auto p-6">
+      <!-- OpenAI Configuration -->
+      <OpenAIConfig
+        :has-open-a-i-configured="hasOpenAIConfigured()"
+        :on-configure-open-a-i="setOpenAIApiKey"
+        :on-test-connection="testOpenAIConnection"
+        @configured="onOpenAIConfigured"
+        @reset="onOpenAIReset"
+      />
+
+
       <!-- Alerts -->
       <AlertBox
         v-if="error"
@@ -45,92 +59,27 @@
         message="Nenhuma API de áudio está disponível. Verifique permissões do sistema e reinicie o aplicativo."
       />
 
-      <!-- Status da API -->
-      <div
-        v-if="apiStatus && apiStatus.status && apiStatus.status !== 'success'"
-        class="mb-6"
-      >
-        <div
-          :class="[
-            'border rounded-md p-4',
-            apiStatus.status === 'error'
-              ? 'bg-red-50 border-red-200'
-              : 'bg-yellow-50 border-yellow-200',
-          ]"
-        >
-          <div class="flex">
-            <svg
-              :class="[
-                'w-5 h-5 mt-0.5',
-                apiStatus.status === 'error'
-                  ? 'text-red-400'
-                  : 'text-yellow-400',
-              ]"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="2"
-                d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.732 16.5c-.77.833.192 2.5 1.732 2.5z"
-              />
-            </svg>
-            <div class="ml-3">
-              <h3
-                :class="[
-                  'text-sm font-medium',
-                  apiStatus.status === 'error'
-                    ? 'text-red-800'
-                    : 'text-yellow-800',
-                ]"
-              >
-                {{
-                  apiStatus.status === "error"
-                    ? "Problema com a API"
-                    : "Aviso da API"
-                }}
-              </h3>
-              <p
-                :class="[
-                  'text-sm mt-1',
-                  apiStatus.status === 'error'
-                    ? 'text-red-700'
-                    : 'text-yellow-700',
-                ]"
-              >
-                {{ apiStatus.message }}
-              </p>
-              <p
-                :class="[
-                  'text-sm mt-1',
-                  apiStatus.status === 'error'
-                    ? 'text-red-600'
-                    : 'text-yellow-600',
-                ]"
-              >
-                {{
-                  apiStatus.status === "error"
-                    ? "A geração de resumos com IA estará indisponível, mas você ainda pode gravar e salvar transcrições."
-                    : "A geração de resumos pode não funcionar corretamente."
-                }}
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
+      <!-- Status da API - Simplificado -->
+      <AlertBox
+        v-if="apiStatus && apiStatus.status === 'error'"
+        type="error"
+        title="API indisponível"
+        :message="apiStatus.message"
+      />
 
       <AlertBox
         v-if="isProcessing"
         type="info"
-        title="Processando com IA..."
-        :message="!transcript ? 'Processando áudio. Para reuniões longas, dividimos em partes menores - isso pode levar alguns minutos.' : 'Gerando resumo da reunião. Isso pode levar alguns segundos.'"
+        title="Processando..."
+        :message="!transcript ? 'Transcrevendo áudio' : 'Gerando resumo'"
       />
 
       <!-- Área de transcrição -->
       <div class="space-y-6">
-        <TranscriptDisplay :transcript="transcript" :is-recording="isRecording" />
+        <TranscriptDisplay
+          :transcript="transcript"
+          :is-recording="isRecording"
+        />
 
         <PostRecordingActions
           v-if="transcript && !isRecording && !isProcessing"
@@ -139,8 +88,6 @@
           @save-transcript="saveWithoutSummary"
         />
 
-
-        <RecordingTips v-if="!transcript && !isRecording && !hasAudio" />
       </div>
     </div>
   </div>
@@ -151,15 +98,19 @@ import { onMounted, onUnmounted, ref, watch } from "vue";
 import { useConfig } from "../composables/useConfig.js";
 import { useHistory } from "../composables/useHistory.js";
 import { useRecorder } from "../composables/useRecorder.js";
-import { formatDuration, downloadFile, formatTimestamp } from "../utils/formatters.js";
+import {
+  downloadFile,
+  formatDuration,
+  formatTimestamp,
+} from "../utils/formatters.js";
 
 // UI Components
-import StatusIndicator from "./ui/StatusIndicator.vue";
-import AlertBox from "./ui/AlertBox.vue";
+import PostRecordingActions from "./recorder/PostRecordingActions.vue";
 import RecordingControls from "./recorder/RecordingControls.vue";
 import TranscriptDisplay from "./recorder/TranscriptDisplay.vue";
-import PostRecordingActions from "./recorder/PostRecordingActions.vue";
-import RecordingTips from "./recorder/RecordingTips.vue";
+import AlertBox from "./ui/AlertBox.vue";
+import OpenAIConfig from "./ui/OpenAIConfig.vue";
+import StatusIndicator from "./ui/StatusIndicator.vue";
 
 // Emits
 const emit = defineEmits(["summary-generated"]);
@@ -178,6 +129,10 @@ const {
   generateSummaryFromTranscript,
   hasAudio,
   audioBlob,
+  setOpenAIApiKey,
+  testOpenAIConnection,
+  estimateTranscriptionCost,
+  hasOpenAIConfigured,
 } = useRecorder();
 
 const { saveMeeting } = useHistory();
@@ -256,36 +211,43 @@ const processAudio = async () => {
   try {
     const fileSizeMB = audioBlob.value.size / (1024 * 1024);
     const durationMinutes = (recordingDuration.value || 0) / 60;
-    
+
     // Mostrar info do arquivo para o usuário
-    console.log(`🎵 Processando áudio: ${fileSizeMB.toFixed(1)}MB, ${durationMinutes.toFixed(1)} minutos`);
-    
+    console.log(
+      `🎵 Processando áudio: ${fileSizeMB.toFixed(
+        1
+      )}MB, ${durationMinutes.toFixed(1)} minutos`
+    );
+
     await transcribeAudio();
-    
+
     if (window.electronAPI?.showNotification) {
       window.electronAPI.showNotification(
-        "Transcrição Concluída", 
+        "Transcrição Concluída",
         `Áudio de ${durationMinutes.toFixed(1)} min processado com sucesso!`
       );
     }
   } catch (err) {
     console.error("Erro ao transcrever áudio:", err);
-    
+
     // Mensagens de erro mais específicas
     let errorMessage = "Erro ao transcrever áudio. ";
-    
-    if (err.message.includes('limit') || err.message.includes('grande')) {
+
+    if (err.message.includes("limit") || err.message.includes("grande")) {
       errorMessage += "Processando reunião longa em partes menores. Aguarde...";
-    } else if (err.message.includes('timeout') || err.message.includes('Timeout')) {
+    } else if (
+      err.message.includes("timeout") ||
+      err.message.includes("Timeout")
+    ) {
       errorMessage += "A API demorou muito para processar. Tente novamente.";
-    } else if (err.message.includes('API ausente')) {
+    } else if (err.message.includes("API ausente")) {
       errorMessage += "Chave da API não configurada. Verifique o arquivo .env";
-    } else if (err.message.includes('upload')) {
+    } else if (err.message.includes("upload")) {
       errorMessage += "Falha no upload do arquivo. Verifique sua conexão.";
     } else {
       errorMessage += err.message;
     }
-    
+
     alert(errorMessage);
   }
 };
@@ -307,9 +269,7 @@ const generateSummary = async () => {
     }
   } catch (err) {
     console.error("Erro ao gerar resumo:", err);
-    alert(
-      "Erro ao gerar resumo. Verifique a chave da API e tente novamente."
-    );
+    alert("Erro ao gerar resumo. Verifique a chave da API e tente novamente.");
   }
 };
 
@@ -336,6 +296,15 @@ const saveWithoutSummary = () => {
   }
 };
 
+// OpenAI configuration handlers
+const onOpenAIConfigured = () => {
+  console.log('✅ OpenAI configurado com sucesso');
+};
+
+const onOpenAIReset = () => {
+  console.log('🔄 OpenAI resetado');
+};
+
 // Watchers
 watch(isRecording, (newValue) => {
   if (!newValue) {
@@ -344,9 +313,7 @@ watch(isRecording, (newValue) => {
       durationInterval = null;
     }
   }
-});
-
-// Processamento automático da transcrição após parar gravação
+});// Processamento automático da transcrição após parar gravação
 watch(hasAudio, (val) => {
   if (val && !transcript.value && !isProcessing.value) {
     // Auto-transcrição após parar gravação

@@ -1,7 +1,7 @@
 <template>
-  <div 
+  <div
     :class="[
-      'border rounded-md p-4 mb-6',
+      'border rounded-md p-4 mb-4',
       type === 'error' && 'bg-red-50 border-red-200',
       type === 'warning' && 'bg-yellow-50 border-yellow-200',
       type === 'info' && 'bg-blue-50 border-blue-200',
