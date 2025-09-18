@@ -52,19 +52,29 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Desktop Capturer para captura de áudio do sistema
   getDesktopCapturer: async (types = ['screen', 'window']) => {
     try {
-      if (!desktopCapturer) {
-        throw new Error('desktopCapturer não disponível');
+      // Verifica se desktopCapturer está disponível
+      if (typeof desktopCapturer === 'undefined' || !desktopCapturer) {
+        console.warn('desktopCapturer não está disponível nesta versão do Electron');
+        return [];
       }
+
       const sources = await desktopCapturer.getSources({
         types: types,
         thumbnailSize: { width: 150, height: 150 },
         fetchWindowIcons: false
       });
+
+      console.log(`📺 ${sources.length} fontes de captura encontradas`);
       return sources;
     } catch (error) {
-      console.error('Erro ao obter fontes de captura:', error);
+      console.warn('Desktop capture não disponível:', error.message);
       return []; // Retorna array vazio em vez de throw para não quebrar o app
     }
+  },
+
+  // Verificar se desktop capturer está disponível
+  hasDesktopCapture: () => {
+    return typeof desktopCapturer !== 'undefined' && !!desktopCapturer;
   }
 });
 

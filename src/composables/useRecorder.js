@@ -36,7 +36,7 @@ export function useRecorder() {
       let stream = null;
 
       // Tenta capturar áudio do sistema primeiro (para reuniões)
-      if (window.electronAPI && window.electronAPI.getDesktopCapturer) {
+      if (window.electronAPI && window.electronAPI.getDesktopCapturer && window.electronAPI.hasDesktopCapture && window.electronAPI.hasDesktopCapture()) {
         try {
           console.log('🎤 Tentando capturar áudio do sistema para reuniões...');
 
@@ -60,6 +60,8 @@ export function useRecorder() {
         } catch (systemError) {
           console.warn('⚠️ Falha na captura do sistema, usando microfone:', systemError.message);
         }
+      } else {
+        console.log('ℹ️ Desktop capture não disponível, usando apenas microfone');
       }
 
       // Fallback: captura apenas microfone se não conseguir áudio do sistema

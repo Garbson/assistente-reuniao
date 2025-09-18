@@ -373,6 +373,9 @@ function createWindow() {
       // e usar o preload.js para expor funcionalidades específicas.
       nodeIntegration: false,
       contextIsolation: true,
+      // Habilitar desktopCapturer
+      enableRemoteModule: false,
+      webSecurity: false, // Necessário para captura de tela em desenvolvimento
     },
     icon: path.join(__dirname, 'public/favicon.ico'),
     titleBarStyle: 'default',
