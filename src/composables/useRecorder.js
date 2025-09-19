@@ -117,10 +117,10 @@ export function useRecorder() {
       if (window.electronAPI?.captureSystemAudio) {
         try {
           const s = await window.electronAPI.captureSystemAudio();
-            if (s && typeof s.getAudioTracks === 'function' && s.getAudioTracks().length) {
-              systemStream = s;
-              console.log('🖥️ Loopback OK:', s.getAudioTracks()[0].label);
-            }
+          if (s && typeof s.getAudioTracks === 'function' && s.getAudioTracks().length) {
+            systemStream = s;
+            console.log('🖥️ Loopback OK:', s.getAudioTracks()[0].label);
+          }
         } catch (e) {
           console.warn('⚠️ loopback falhou:', e.message);
         }
