@@ -53,7 +53,7 @@ const props = defineProps({
   captureType: {
     type: String,
     required: true,
-    validator: (value) => ['system', 'microphone', 'unknown'].includes(value)
+    validator: (value) => ['system', 'microphone', 'hybrid', 'unknown'].includes(value)
   },
   isCapturingFullMeeting: {
     type: Boolean,
@@ -62,6 +62,18 @@ const props = defineProps({
   sourceCount: {
     type: Number,
     default: 0
+  },
+  isCapturingInput: {
+    type: Boolean,
+    default: false
+  },
+  isCapturingOutput: {
+    type: Boolean,
+    default: false
+  },
+  audioQuality: {
+    type: Object,
+    default: () => ({ input: 0, output: 0 })
   }
 });
 
@@ -69,6 +81,8 @@ const indicatorClasses = computed(() => {
   switch (props.captureType) {
     case 'system':
       return 'bg-green-100 text-green-800 border border-green-200';
+    case 'hybrid':
+      return 'bg-blue-100 text-blue-800 border border-blue-200';
     case 'microphone':
       return 'bg-orange-100 text-orange-800 border border-orange-200';
     default:
@@ -80,6 +94,8 @@ const iconClasses = computed(() => {
   switch (props.captureType) {
     case 'system':
       return 'text-green-600';
+    case 'hybrid':
+      return 'text-blue-600';
     case 'microphone':
       return 'text-orange-600';
     default:
@@ -88,9 +104,13 @@ const iconClasses = computed(() => {
 });
 
 const title = computed(() => {
+  const inputOutput = props.isCapturingInput && props.isCapturingOutput;
+
   switch (props.captureType) {
     case 'system':
-      return '👥 Reunião Completa';
+      return inputOutput ? '👥🔊 Sistema + Entrada' : '👥 Sistema';
+    case 'hybrid':
+      return '🔄 Captura Híbrida';
     case 'microphone':
       return '🎤 Apenas Você';
     default:
@@ -99,11 +119,17 @@ const title = computed(() => {
 });
 
 const subtitle = computed(() => {
+  const qualityInfo = props.audioQuality.input > 0 || props.audioQuality.output > 0
+    ? ` (${props.audioQuality.input > 0 ? 'Entrada: ' + props.audioQuality.input + '%' : ''}${props.audioQuality.input > 0 && props.audioQuality.output > 0 ? ' | ' : ''}${props.audioQuality.output > 0 ? 'Saída: ' + props.audioQuality.output + '%' : ''})`
+    : '';
+
   switch (props.captureType) {
     case 'system':
-      return 'Capturando áudio de todos os participantes';
+      return 'Capturando áudio do sistema' + qualityInfo;
+    case 'hybrid':
+      return 'Tentando captura de sistema' + qualityInfo;
     case 'microphone':
-      return 'Capturando apenas seu microfone';
+      return 'Capturando apenas microfone' + qualityInfo;
     default:
       return 'Detectando tipo de captura';
   }

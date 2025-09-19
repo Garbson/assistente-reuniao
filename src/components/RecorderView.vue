@@ -24,6 +24,9 @@
             :capture-type="audioCaptureType"
             :is-capturing-full-meeting="isCapturingFullMeeting"
             :source-count="audioSources.length"
+            :is-capturing-input="isCapturingInput"
+            :is-capturing-output="isCapturingOutput"
+            :audio-quality="audioQuality"
           />
           <RecordingControls
             :is-recording="isRecording"
@@ -40,6 +43,11 @@
 
     <!-- Conteúdo principal -->
     <div class="flex-1 overflow-y-auto p-6">
+      <!-- Setup do BlackHole para captura completa -->
+      <BlackHoleSetup v-if="!isRecording" @blackhole-configured="onBlackHoleConfigured" />
+
+      <!-- Botão de teste de captura de áudio -->
+      <AudioTestButton v-if="!isRecording" />
 
 
       <!-- Alerts -->
@@ -57,12 +65,36 @@
         message="Nenhuma API de áudio está disponível. Verifique permissões do sistema e reinicie o aplicativo."
       />
 
-      <!-- Alerta sobre captura limitada -->
+      <!-- Alerta específico para Teams -->
       <AlertBox
-        v-if="audioCaptureType === 'microphone' && isRecording"
+        v-if="isRecording && !isCapturingOutput && audioCaptureType === 'microphone' && detectedMeetingApp.includes('Teams')"
         type="warning"
-        title="⚠️ Captura limitada"
-        message="Gravando apenas seu áudio. Para capturar todos os participantes, configure captura de áudio do sistema ou use um dispositivo de áudio virtual."
+        title="🏢 Microsoft Teams - Instruções Especiais"
+        message="O Teams detectado está bloqueando captura de áudio. SOLUÇÃO: 1) Pare a gravação 2) Inicie novamente 3) Quando aparecer o popup, escolha 'Compartilhar Tela' 4) MARQUE 'Compartilhar áudio do sistema' 5) Selecione a tela/janela do Teams."
+      />
+
+      <!-- Alerta genérico para outros casos -->
+      <AlertBox
+        v-if="isRecording && !isCapturingOutput && audioCaptureType === 'microphone' && !detectedMeetingApp.includes('Teams')"
+        type="warning"
+        title="⚠️ Capturando apenas sua voz"
+        message="O áudio dos outros participantes não está sendo capturado. Para gravar reuniões completas, use compartilhamento de tela com áudio ou configure um dispositivo de áudio virtual."
+      />
+
+      <!-- Alerta quando captura híbrida pode não estar funcionando -->
+      <AlertBox
+        v-if="isRecording && audioCaptureType === 'hybrid' && !isCapturingOutput && audioQuality.input === 0"
+        type="warning"
+        title="🔄 Verificando captura híbrida"
+        message="Tentando capturar áudio do sistema. Se não funcionar, será usado apenas o microfone."
+      />
+
+      <!-- Alerta positivo quando está capturando entrada + saída -->
+      <AlertBox
+        v-if="isRecording && isCapturingInput && isCapturingOutput"
+        type="success"
+        title="✅ Captura completa ativa"
+        message="Gravando tanto sua voz quanto o áudio dos outros participantes."
       />
 
       <!-- Status da API - Simplificado -->
@@ -116,6 +148,8 @@ import RecordingControls from "./recorder/RecordingControls.vue";
 import TranscriptDisplay from "./recorder/TranscriptDisplay.vue";
 import AlertBox from "./ui/AlertBox.vue";
 import AudioCaptureIndicator from "./ui/AudioCaptureIndicator.vue";
+import AudioTestButton from "./ui/AudioTestButton.vue";
+import BlackHoleSetup from "./ui/BlackHoleSetup.vue";
 import StatusIndicator from "./ui/StatusIndicator.vue";
 
 // Emits
@@ -143,6 +177,10 @@ const {
   audioCaptureType,
   isCapturingFullMeeting,
   audioSources,
+  isCapturingInput,
+  isCapturingOutput,
+  audioQuality,
+  detectedMeetingApp,
 } = useRecorder();
 
 const { saveMeeting } = useHistory();
@@ -302,6 +340,18 @@ const saveWithoutSummary = () => {
     window.electronAPI.showNotification(
       "Reunião Salva",
       "A transcrição foi salva com sucesso!"
+    );
+  }
+};
+
+const onBlackHoleConfigured = (deviceInfo) => {
+  console.log('✅ BlackHole configurado:', deviceInfo);
+
+  // Notificação de sucesso
+  if (window.electronAPI?.showNotification) {
+    window.electronAPI.showNotification(
+      "BlackHole Configurado",
+      `${deviceInfo.label} pronto para captura completa!`
     );
   }
 };

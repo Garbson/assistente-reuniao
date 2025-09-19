@@ -12,9 +12,15 @@ export function useRecorder() {
   const audioBlob = ref(null);
 
   // Estado da captura de áudio
-  const audioCaptureType = ref('unknown'); // 'system', 'microphone', 'unknown'
+  const audioCaptureType = ref('unknown'); // 'system', 'microphone', 'hybrid', 'unknown'
   const isCapturingFullMeeting = ref(false); // true se capturando áudio de todos
   const audioSources = ref([]); // fontes disponíveis
+
+  // Detalhes específicos da captura
+  const isCapturingInput = ref(false); // microfone/entrada
+  const isCapturingOutput = ref(false); // sistema/saída
+  const audioQuality = ref({ input: 0, output: 0 }); // níveis de áudio detectados
+  const detectedMeetingApp = ref(''); // Teams, Meet, Zoom detectado
   
 
   let mediaRecorder = null;
@@ -27,6 +33,8 @@ export function useRecorder() {
   let OPENAI_ORG_ID = localStorage.getItem('openai_org_id') || null;
 
   let openaiTranscription = null;
+  let audioAnalyzer = null;
+  let analysisInterval = null;
 
   const checkSupport = () => {
     isSupported.value = !!(navigator.mediaDevices && window.MediaRecorder);
@@ -34,11 +42,130 @@ export function useRecorder() {
     return isSupported.value;
   };
 
+  // Função para analisar qualidade do áudio em tempo real
+  const analyzeAudioStream = (stream) => {
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      const audioContext = new AudioContextClass();
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyzer = audioContext.createAnalyser();
+
+      analyzer.fftSize = 256;
+      const bufferLength = analyzer.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+
+      source.connect(analyzer);
+
+      audioAnalyzer = { audioContext, analyzer, dataArray };
+
+      // Analisa o áudio a cada 100ms
+      analysisInterval = setInterval(() => {
+        analyzer.getByteFrequencyData(dataArray);
+
+        // Calcula nível médio de áudio
+        const average = dataArray.reduce((a, b) => a + b) / bufferLength;
+        const normalizedLevel = Math.round((average / 255) * 100);
+
+        // Detecta se há áudio ativo (acima de threshold)
+        const hasSignal = normalizedLevel > 5;
+
+        if (hasSignal) {
+          console.log(`🎵 Nível de áudio detectado: ${normalizedLevel}% (Tipo: ${audioCaptureType.value})`);
+
+          // Análise mais detalhada para detectar se é entrada ou saída
+          const frequencySpread = Math.max(...dataArray) - Math.min(...dataArray);
+          const highFreqEnergy = dataArray.slice(Math.floor(bufferLength * 0.7)).reduce((a, b) => a + b);
+
+          console.log(`📊 Análise: spread=${frequencySpread}, highFreq=${highFreqEnergy}, tracks=${audioAnalyzer.source?.mediaStream?.getAudioTracks().length || 0}`);
+
+          // Atualiza qualidade baseado no tipo de captura
+          if (audioCaptureType.value === 'microphone') {
+            audioQuality.value.input = normalizedLevel;
+            isCapturingInput.value = true;
+            isCapturingOutput.value = false;
+          } else if (audioCaptureType.value === 'system' || audioCaptureType.value === 'hybrid') {
+            // Para sistema/híbrido, precisa detectar se realmente está pegando saída
+            // Se apenas detecta áudio quando você fala = só microfone
+            // Se detecta áudio mesmo quando você não fala = sistema também
+            audioQuality.value.output = normalizedLevel;
+            isCapturingOutput.value = true;
+
+            // Se também está detectando entrada, marca ambos
+            if (normalizedLevel > 10) {
+              audioQuality.value.input = normalizedLevel * 0.8; // Assume alguma entrada também
+              isCapturingInput.value = true;
+            }
+          }
+        }
+      }, 100);
+
+    } catch (error) {
+      console.warn('⚠️ Análise de áudio não disponível:', error.message);
+    }
+  };
+
+  // Função para parar análise
+  const stopAudioAnalysis = () => {
+    if (analysisInterval) {
+      clearInterval(analysisInterval);
+      analysisInterval = null;
+    }
+    if (audioAnalyzer) {
+      audioAnalyzer.audioContext.close();
+      audioAnalyzer = null;
+    }
+  };
+
+  // Função para detectar aplicativo de reunião ativo
+  const detectMeetingApp = async () => {
+    const userAgent = navigator.userAgent.toLowerCase();
+    const currentUrl = window.location.href.toLowerCase();
+
+    // Detecta por URL (quando executado em browser)
+    if (currentUrl.includes('teams.microsoft.com') || currentUrl.includes('teams.live.com')) {
+      detectedMeetingApp.value = 'Microsoft Teams';
+      return 'teams';
+    } else if (currentUrl.includes('meet.google.com')) {
+      detectedMeetingApp.value = 'Google Meet';
+      return 'meet';
+    } else if (currentUrl.includes('zoom.us')) {
+      detectedMeetingApp.value = 'Zoom';
+      return 'zoom';
+    }
+
+    // Detecta por título da janela (quando executado em Electron)
+    if (window.electronAPI && window.electronAPI.getMeetingDebug) {
+      try {
+        const debug = await window.electronAPI.getMeetingDebug();
+        const title = debug.lastMeetingTitle?.toLowerCase() || '';
+
+        if (title.includes('teams') || title.includes('microsoft teams')) {
+          detectedMeetingApp.value = 'Microsoft Teams';
+          return 'teams';
+        } else if (title.includes('meet') || title.includes('google meet')) {
+          detectedMeetingApp.value = 'Google Meet';
+          return 'meet';
+        } else if (title.includes('zoom')) {
+          detectedMeetingApp.value = 'Zoom';
+          return 'zoom';
+        }
+      } catch (error) {
+        console.warn('Falha ao detectar app de reunião:', error);
+      }
+    }
+
+    return 'unknown';
+  };
+
   const startRecording = async () => {
     if (!checkSupport()) return;
     if (isRecording.value) return;
     try {
       let stream = null;
+
+      // Detecta o aplicativo de reunião primeiro
+      const meetingApp = await detectMeetingApp();
+      console.log(`🔍 Aplicativo detectado: ${detectedMeetingApp.value || 'Desconhecido'}`);
 
       // Tenta capturar áudio do sistema primeiro (para reuniões)
       if (window.electronAPI && window.electronAPI.getDesktopCapturer && window.electronAPI.hasDesktopCapture && window.electronAPI.hasDesktopCapture()) {
@@ -65,12 +192,98 @@ export function useRecorder() {
             audioCaptureType.value = 'system';
             isCapturingFullMeeting.value = true;
             console.log('✅ Captura de áudio do sistema ativada - ÁUDIO COMPLETO DA REUNIÃO');
+
+            // Inicia análise para verificar se realmente está capturando sistema
+            analyzeAudioStream(stream);
           }
         } catch (systemError) {
           console.warn('⚠️ Falha na captura do sistema, usando microfone:', systemError.message);
         }
       } else {
-        console.log('ℹ️ Desktop capture não disponível, usando apenas microfone');
+        console.log('ℹ️ Desktop capture não disponível, tentando captura híbrida...');
+      }
+
+      // Tentativa de captura híbrida específica para Teams
+      if (!stream) {
+        try {
+          if (meetingApp === 'teams') {
+            console.log('🔄 Usando estratégia específica para Microsoft Teams...');
+          } else {
+            console.log('🔄 Tentando captura híbrida para reuniões...');
+          }
+
+          // Para Teams: força compartilhamento de tela com áudio
+          const displayMediaOptions = meetingApp === 'teams' ? {
+            video: {
+              mediaSource: 'screen' // Force tela inteira para Teams
+            },
+            audio: {
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false,
+              sampleRate: 48000, // Teams usa 48kHz
+              channelCount: 2,
+              latency: 0
+            }
+          } : {
+            video: true,
+            audio: {
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false,
+              sampleRate: 44100,
+              channelCount: 2,
+              latency: 0
+            }
+          };
+
+          stream = await navigator.mediaDevices.getDisplayMedia(displayMediaOptions);
+
+          if (stream && stream.getAudioTracks().length > 0) {
+            // Remove vídeo mas mantém áudio
+            const videoTracks = stream.getVideoTracks();
+            const audioTracks = stream.getAudioTracks();
+
+            console.log(`🔍 Captura híbrida obtida - Vídeo: ${videoTracks.length}, Áudio: ${audioTracks.length}`);
+            console.log(`🎤 Audio tracks info:`, audioTracks.map(track => ({
+              label: track.label,
+              kind: track.kind,
+              enabled: track.enabled,
+              muted: track.muted,
+              settings: track.getSettings()
+            })));
+
+            videoTracks.forEach(track => {
+              track.stop();
+              stream.removeTrack(track);
+            });
+
+            audioCaptureType.value = 'hybrid';
+            isCapturingFullMeeting.value = true;
+            console.log('✅ Captura híbrida Teams ativada - incluindo áudio dos participantes');
+            analyzeAudioStream(stream);
+          }
+        } catch (hybridError) {
+          console.warn('⚠️ Captura híbrida falhou:', hybridError.message);
+
+          // Tentativa final: getDisplayMedia só com áudio
+          try {
+            console.log('🔄 Tentativa final: captura de áudio apenas...');
+            stream = await navigator.mediaDevices.getDisplayMedia({
+              video: false,
+              audio: true
+            });
+
+            if (stream && stream.getAudioTracks().length > 0) {
+              audioCaptureType.value = 'hybrid';
+              isCapturingFullMeeting.value = true;
+              console.log('✅ Captura de áudio do sistema ativada');
+              analyzeAudioStream(stream);
+            }
+          } catch (finalError) {
+            console.warn('⚠️ Todas as tentativas de captura de sistema falharam:', finalError.message);
+          }
+        }
       }
 
       // Fallback: captura apenas microfone se não conseguir áudio do sistema
@@ -89,6 +302,9 @@ export function useRecorder() {
         audioCaptureType.value = 'microphone';
         isCapturingFullMeeting.value = false;
         console.log('⚠️ CAPTURANDO APENAS SEU ÁUDIO - outros participantes não serão transcritos');
+
+        // Inicia análise para confirmar captura de microfone
+        analyzeAudioStream(stream);
       }
 
       const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
@@ -116,6 +332,10 @@ export function useRecorder() {
         hasAudio.value = true;
         isRecording.value = false;
         stream.getTracks().forEach(t => t.stop());
+
+        // Para análise de áudio
+        stopAudioAnalysis();
+
         // Reset do estado de captura
         resetCaptureState();
       };
@@ -704,6 +924,10 @@ export function useRecorder() {
     audioCaptureType.value = 'unknown';
     isCapturingFullMeeting.value = false;
     audioSources.value = [];
+    isCapturingInput.value = false;
+    isCapturingOutput.value = false;
+    audioQuality.value = { input: 0, output: 0 };
+    stopAudioAnalysis();
   };
 
   onMounted(() => {
@@ -728,6 +952,10 @@ export function useRecorder() {
     audioCaptureType,
     isCapturingFullMeeting,
     audioSources,
+    isCapturingInput,
+    isCapturingOutput,
+    audioQuality,
+    detectedMeetingApp,
     // Funções
     startRecording,
     stopRecording,
