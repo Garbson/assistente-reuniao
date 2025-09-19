@@ -12,7 +12,7 @@ export function useRecorder() {
   const audioBlob = ref(null);
 
   // Estado da captura de áudio
-  const audioCaptureType = ref('unknown'); // 'system', 'microphone', 'hybrid', 'unknown'
+  const audioCaptureType = ref('unknown'); // 'system', 'microfone', 'hybrid', 'unknown'
   const isCapturingFullMeeting = ref(false); // true se capturando áudio de todos
   const audioSources = ref([]); // fontes disponíveis
 
@@ -21,7 +21,7 @@ export function useRecorder() {
   const isCapturingOutput = ref(false); // sistema/saída
   const audioQuality = ref({ input: 0, output: 0 }); // níveis de áudio detectados
   const detectedMeetingApp = ref(''); // Teams, Meet, Zoom detectado
-  
+
 
   let mediaRecorder = null;
   let audioChunks = [];
@@ -42,66 +42,12 @@ export function useRecorder() {
     return isSupported.value;
   };
 
-  // Função para analisar qualidade do áudio em tempo real
+  // Função SEGURA para analisar qualidade do áudio em tempo real
   const analyzeAudioStream = (stream) => {
-    try {
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      const audioContext = new AudioContextClass();
-      const source = audioContext.createMediaStreamSource(stream);
-      const analyzer = audioContext.createAnalyser();
+    // DESABILITADO TEMPORARIAMENTE para evitar crashes
+    console.log('🔊 Análise de áudio DESABILITADA (evitando crashes)');
+    return;
 
-      analyzer.fftSize = 256;
-      const bufferLength = analyzer.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-
-      source.connect(analyzer);
-
-      audioAnalyzer = { audioContext, analyzer, dataArray };
-
-      // Analisa o áudio a cada 100ms
-      analysisInterval = setInterval(() => {
-        analyzer.getByteFrequencyData(dataArray);
-
-        // Calcula nível médio de áudio
-        const average = dataArray.reduce((a, b) => a + b) / bufferLength;
-        const normalizedLevel = Math.round((average / 255) * 100);
-
-        // Detecta se há áudio ativo (acima de threshold)
-        const hasSignal = normalizedLevel > 5;
-
-        if (hasSignal) {
-          console.log(`🎵 Nível de áudio detectado: ${normalizedLevel}% (Tipo: ${audioCaptureType.value})`);
-
-          // Análise mais detalhada para detectar se é entrada ou saída
-          const frequencySpread = Math.max(...dataArray) - Math.min(...dataArray);
-          const highFreqEnergy = dataArray.slice(Math.floor(bufferLength * 0.7)).reduce((a, b) => a + b);
-
-          console.log(`📊 Análise: spread=${frequencySpread}, highFreq=${highFreqEnergy}, tracks=${audioAnalyzer.source?.mediaStream?.getAudioTracks().length || 0}`);
-
-          // Atualiza qualidade baseado no tipo de captura
-          if (audioCaptureType.value === 'microphone') {
-            audioQuality.value.input = normalizedLevel;
-            isCapturingInput.value = true;
-            isCapturingOutput.value = false;
-          } else if (audioCaptureType.value === 'system' || audioCaptureType.value === 'hybrid') {
-            // Para sistema/híbrido, precisa detectar se realmente está pegando saída
-            // Se apenas detecta áudio quando você fala = só microfone
-            // Se detecta áudio mesmo quando você não fala = sistema também
-            audioQuality.value.output = normalizedLevel;
-            isCapturingOutput.value = true;
-
-            // Se também está detectando entrada, marca ambos
-            if (normalizedLevel > 10) {
-              audioQuality.value.input = normalizedLevel * 0.8; // Assume alguma entrada também
-              isCapturingInput.value = true;
-            }
-          }
-        }
-      }, 100);
-
-    } catch (error) {
-      console.warn('⚠️ Análise de áudio não disponível:', error.message);
-    }
   };
 
   // Função para parar análise
@@ -157,165 +103,201 @@ export function useRecorder() {
     return 'unknown';
   };
 
+  // Variáveis para streams separados (como Notion)
+  let microphoneStream = null;
+  let systemAudioStream = null;
+  let audioContext = null;
+
   const startRecording = async () => {
-    if (!checkSupport()) return;
-    if (isRecording.value) return;
+    if (!checkSupport() || isRecording.value) return;
+    console.log('🎬 Iniciando captura: system(loopback) + microfone');
     try {
-      let stream = null;
-
-      // Detecta o aplicativo de reunião primeiro
-      const meetingApp = await detectMeetingApp();
-      console.log(`🔍 Aplicativo detectado: ${detectedMeetingApp.value || 'Desconhecido'}`);
-
-      // Tenta capturar áudio do sistema primeiro (para reuniões)
-      if (window.electronAPI && window.electronAPI.getDesktopCapturer && window.electronAPI.hasDesktopCapture && window.electronAPI.hasDesktopCapture()) {
+      // Captura do sistema (mantém lógica atual funcionando) – prioriza handler loopback do preload
+      let systemStream = null;
+      if (window.electronAPI?.captureSystemAudio) {
         try {
-          console.log('🎤 Tentando capturar áudio do sistema para reuniões...');
-
-          // Obtém fontes de captura de tela
-          const sources = await window.electronAPI.getDesktopCapturer(['screen', 'window']);
-          audioSources.value = sources || [];
-
-          if (sources && sources.length > 0) {
-            // Usa a primeira fonte disponível com áudio do sistema
-            stream = await navigator.mediaDevices.getUserMedia({
-              audio: {
-                mandatory: {
-                  chromeMediaSource: 'desktop',
-                  chromeMediaSourceId: sources[0].id
-                }
-              },
-              video: false
-            });
-
-            // Configura estado para captura do sistema
-            audioCaptureType.value = 'system';
-            isCapturingFullMeeting.value = true;
-            console.log('✅ Captura de áudio do sistema ativada - ÁUDIO COMPLETO DA REUNIÃO');
-
-            // Inicia análise para verificar se realmente está capturando sistema
-            analyzeAudioStream(stream);
-          }
-        } catch (systemError) {
-          console.warn('⚠️ Falha na captura do sistema, usando microfone:', systemError.message);
+          const s = await window.electronAPI.captureSystemAudio();
+            if (s && typeof s.getAudioTracks === 'function' && s.getAudioTracks().length) {
+              systemStream = s;
+              console.log('🖥️ Loopback OK:', s.getAudioTracks()[0].label);
+            }
+        } catch (e) {
+          console.warn('⚠️ loopback falhou:', e.message);
         }
-      } else {
-        console.log('ℹ️ Desktop capture não disponível, tentando captura híbrida...');
       }
-
-      // Tentativa de captura híbrida específica para Teams
-      if (!stream) {
+      // Tentativa 1: somente áudio (ideal para handler)
+      if (!systemStream) {
         try {
-          if (meetingApp === 'teams') {
-            console.log('🔄 Usando estratégia específica para Microsoft Teams...');
+          console.log('🧪 Tentativa 1: getDisplayMedia({audio:true, video:false})');
+          const pureAudio = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: false });
+          if (pureAudio.getAudioTracks().length) {
+            systemStream = pureAudio;
+            console.log('�️ System audio (pure) OK:', systemStream.getAudioTracks()[0].label);
           } else {
-            console.log('🔄 Tentando captura híbrida para reuniões...');
+            pureAudio.getTracks().forEach(t => t.stop());
           }
-
-          // Para Teams: força compartilhamento de tela com áudio
-          const displayMediaOptions = meetingApp === 'teams' ? {
-            video: {
-              mediaSource: 'screen' // Force tela inteira para Teams
-            },
-            audio: {
-              echoCancellation: false,
-              noiseSuppression: false,
-              autoGainControl: false,
-              sampleRate: 48000, // Teams usa 48kHz
-              channelCount: 2,
-              latency: 0
-            }
-          } : {
-            video: true,
-            audio: {
-              echoCancellation: false,
-              noiseSuppression: false,
-              autoGainControl: false,
-              sampleRate: 44100,
-              channelCount: 2,
-              latency: 0
-            }
-          };
-
-          stream = await navigator.mediaDevices.getDisplayMedia(displayMediaOptions);
-
-          if (stream && stream.getAudioTracks().length > 0) {
-            // Remove vídeo mas mantém áudio
-            const videoTracks = stream.getVideoTracks();
-            const audioTracks = stream.getAudioTracks();
-
-            console.log(`🔍 Captura híbrida obtida - Vídeo: ${videoTracks.length}, Áudio: ${audioTracks.length}`);
-            console.log(`🎤 Audio tracks info:`, audioTracks.map(track => ({
-              label: track.label,
-              kind: track.kind,
-              enabled: track.enabled,
-              muted: track.muted,
-              settings: track.getSettings()
-            })));
-
-            videoTracks.forEach(track => {
-              track.stop();
-              stream.removeTrack(track);
-            });
-
-            audioCaptureType.value = 'hybrid';
-            isCapturingFullMeeting.value = true;
-            console.log('✅ Captura híbrida Teams ativada - incluindo áudio dos participantes');
-            analyzeAudioStream(stream);
-          }
-        } catch (hybridError) {
-          console.warn('⚠️ Captura híbrida falhou:', hybridError.message);
-
-          // Tentativa final: getDisplayMedia só com áudio
-          try {
-            console.log('🔄 Tentativa final: captura de áudio apenas...');
-            stream = await navigator.mediaDevices.getDisplayMedia({
-              video: false,
-              audio: true
-            });
-
-            if (stream && stream.getAudioTracks().length > 0) {
-              audioCaptureType.value = 'hybrid';
-              isCapturingFullMeeting.value = true;
-              console.log('✅ Captura de áudio do sistema ativada');
-              analyzeAudioStream(stream);
-            }
-          } catch (finalError) {
-            console.warn('⚠️ Todas as tentativas de captura de sistema falharam:', finalError.message);
-          }
+        } catch (e) {
+          console.warn('⚠️ Tentativa 1 falhou:', e.message);
         }
       }
+      if (!systemStream) {
+        console.log('�🔄 Fallback loopback via getDisplayMedia...');
+        try {
+          const fallback = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+          fallback.getVideoTracks().forEach(t => { t.stop(); fallback.removeTrack(t); });
+          if (fallback.getAudioTracks().length) {
+            systemStream = fallback;
+            console.log('🖥️ Fallback system OK:', systemStream.getAudioTracks()[0].label);
+          }
+        } catch (e) {
+          console.warn('⚠️ getDisplayMedia sem system audio:', e.message);
+        }
+      }
+      if (!systemStream) {
+        console.warn('❌ Nenhum áudio do sistema obtido após todas as tentativas. Prosseguindo só com microfone.');
+      }
 
-      // Fallback: captura apenas microfone se não conseguir áudio do sistema
-      if (!stream) {
-        console.log('🎤 Usando captura de microfone padrão');
-        stream = await navigator.mediaDevices.getUserMedia({
+      // Captura microfone
+      try {
+        microphoneStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: true,
-            sampleRate: 44100 // Alta qualidade para melhor transcrição
+            autoGainControl: true
           }
         });
-
-        // Configura estado para apenas microfone
-        audioCaptureType.value = 'microphone';
-        isCapturingFullMeeting.value = false;
-        console.log('⚠️ CAPTURANDO APENAS SEU ÁUDIO - outros participantes não serão transcritos');
-
-        // Inicia análise para confirmar captura de microfone
-        analyzeAudioStream(stream);
+        console.log('🎤 Microfone OK:', microphoneStream.getAudioTracks()[0]?.label);
+        isCapturingInput.value = true;
+      } catch (e) {
+        console.warn('⚠️ Microfone indisponível:', e.message);
+        microphoneStream = null;
       }
 
+      if (systemStream) {
+        systemAudioStream = systemStream;
+        isCapturingOutput.value = true;
+        // Heurística: alguns ambientes retornam track do próprio mic como "default" / "communications" quando loopback falha
+        const label = systemStream.getAudioTracks()[0]?.label?.toLowerCase() || '';
+        if (label && (label.includes('microphone') || label.includes('mic') || label.includes('input'))) {
+          console.warn('⚠️ A track de "system" parece ser microfone (label heurística).');
+        }
+      }
+
+      if (!systemAudioStream && !microphoneStream) {
+        error.value = 'Nenhuma fonte de áudio disponível';
+        return;
+      }
+
+      let finalStream;
+      if (systemAudioStream && microphoneStream) {
+        audioCaptureType.value = 'hybrid';
+        isCapturingFullMeeting.value = true;
+        finalStream = await mixStreamsHybrid(microphoneStream, systemAudioStream);
+        console.log('✅ Híbrido ativo (mix system + mic)');
+      } else if (systemAudioStream) {
+        audioCaptureType.value = 'system';
+        isCapturingFullMeeting.value = true;
+        finalStream = systemAudioStream;
+        console.log('🎧 Apenas system audio');
+      } else {
+        audioCaptureType.value = 'microphone';
+        isCapturingFullMeeting.value = false;
+        finalStream = microphoneStream;
+        console.log('🎤 Apenas microfone');
+      }
+
+      await setupRecording(finalStream);
+    } catch (e) {
+      console.error('❌ Erro na captura combinada:', e);
+      await cleanupStreams();
+      throw e;
+    }
+  };
+
+  // Função para limpar recursos
+  const cleanupStreams = async () => {
+    console.log('🧹 Limpando streams...');
+
+    stopAudioAnalysis();
+
+    if (microphoneStream) {
+      microphoneStream.getTracks().forEach(track => track.stop());
+      microphoneStream = null;
+    }
+
+    if (systemAudioStream) {
+      systemAudioStream.getTracks().forEach(track => track.stop());
+      systemAudioStream = null;
+    }
+
+    if (audioContext && audioContext.state !== 'closed') {
+      await audioContext.close();
+      audioContext = null;
+    }
+
+    resetCaptureState();
+  };
+
+  // Mixagem híbrida (microfone + sistema) com Web Audio
+  const mixStreamsHybrid = async (micStream, sysStream) => {
+    try {
+      if (!micStream || !sysStream) return micStream || sysStream;
+
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) {
+        console.warn('⚠️ AudioContext indisponível, usando fallback simples.');
+        // Fallback: junta tracks em novo MediaStream (se suportado)
+        const merged = new MediaStream();
+        micStream.getAudioTracks().forEach(t => merged.addTrack(t));
+        sysStream.getAudioTracks().forEach(t => merged.addTrack(t));
+        return merged;
+      }
+
+      audioContext = new AudioContextClass({ latencyHint: 'interactive' });
+      const destination = audioContext.createMediaStreamDestination();
+
+      const micSource = audioContext.createMediaStreamSource(micStream);
+      const sysSource = audioContext.createMediaStreamSource(sysStream);
+
+      // Ganhos equilibrados (sistema normalmente já vem mais alto)
+      const micGain = audioContext.createGain();
+      const sysGain = audioContext.createGain();
+      micGain.gain.value = 1.2; // Leve boost no microfone
+      sysGain.gain.value = 0.9; // Leve redução no sistema
+
+      micSource.connect(micGain).connect(destination);
+      sysSource.connect(sysGain).connect(destination);
+
+      console.log('🔗 Mixagem híbrida criada (mic + system)');
+      return destination.stream;
+    } catch (e) {
+      console.error('❌ Falha na mixagem híbrida:', e.message);
+      // Fallback: retorna system se existir, senão mic
+      return sysStream || micStream;
+    }
+  };
+
+  // Função simplificada para configurar MediaRecorder (método Notion)
+  const setupRecording = async (stream) => {
+    try {
+      if (!stream || stream.getAudioTracks().length === 0) {
+        throw new Error('Stream de áudio inválido');
+      }
+
+      console.log('🎬 Configurando gravação (tipo:', audioCaptureType.value, ')...');
+
+      // MIME type simples e compatível
       const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
         ? 'audio/webm;codecs=opus'
-        : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg');
+        : 'audio/webm';
 
+      // MediaRecorder SIMPLES como Notion
       mediaRecorder = new MediaRecorder(stream, {
         mimeType,
-        audioBitsPerSecond: 128000 // Alta qualidade para melhor transcrição
+        audioBitsPerSecond: 128000  // Qualidade padrão
       });
 
+      // Reset estado
       audioChunks = [];
       transcript.value = '';
       audioBlob.value = null;
@@ -323,42 +305,54 @@ export function useRecorder() {
       error.value = null;
       startTime = new Date();
 
-      mediaRecorder.ondataavailable = e => {
-        if (e.data && e.data.size > 0) audioChunks.push(e.data);
+      // Event handlers SIMPLES
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          audioChunks.push(e.data);
+        }
       };
 
       mediaRecorder.onstop = () => {
-        audioBlob.value = new Blob(audioChunks, { type: mimeType });
-        hasAudio.value = true;
-        isRecording.value = false;
-        stream.getTracks().forEach(t => t.stop());
+        console.log('🛑 Finalizando gravação...');
 
-        // Para análise de áudio
+        if (audioChunks.length > 0) {
+          audioBlob.value = new Blob(audioChunks, { type: mimeType });
+          hasAudio.value = true;
+          console.log(`✅ Gravação finalizada: ${(audioBlob.value.size / 1024 / 1024).toFixed(2)}MB`);
+        }
+
+        isRecording.value = false;
         stopAudioAnalysis();
 
-        // Reset do estado de captura
-        resetCaptureState();
+        // Parar stream
+        stream.getTracks().forEach(track => track.stop());
       };
 
-      mediaRecorder.start(500);
+      mediaRecorder.onerror = (e) => {
+        console.error('❌ Erro na gravação:', e.error);
+        error.value = `Erro na gravação: ${e.error?.message || 'Desconhecido'}`;
+        isRecording.value = false;
+      };
+
+      // Iniciar gravação (método Notion)
+      mediaRecorder.start(1000); // Chunks de 1 segundo
       isRecording.value = true;
 
-      console.log(`🔴 Gravação iniciada com ${stream.getAudioTracks()[0].label}`);
+      console.log('✅ Gravação iniciada com sucesso (método Notion)!');
 
-    } catch (e) {
-      console.error('❌ Erro na gravação:', e);
-      if (e.name === 'NotAllowedError') {
-        error.value = 'Permissão de áudio negada. Para capturar reuniões, permita acesso ao áudio.';
-      } else if (e.name === 'NotFoundError') {
-        error.value = 'Nenhum dispositivo de áudio encontrado.';
-      } else {
-        error.value = `Erro ao iniciar gravação: ${e.message}`;
-      }
+    } catch (setupError) {
+      console.error('❌ Erro ao configurar gravação:', setupError.message);
+      error.value = `Erro ao configurar gravação: ${setupError.message}`;
+      isRecording.value = false;
+      throw setupError;
     }
   };
 
-  const stopRecording = () => {
-    if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+  const stopRecording = async () => {
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+      mediaRecorder.stop();
+    }
+    await cleanupStreams();
   };
 
   const clearTranscript = () => {
@@ -375,11 +369,11 @@ export function useRecorder() {
     if (!audioBlob.value) throw new Error('Nenhum áudio disponível.');
     isProcessing.value = true;
     error.value = null;
-    
+
     try {
       const fileSizeMB = audioBlob.value.size / (1024 * 1024);
       const durationMinutes = getRecordingDuration() / 60;
-      
+
       console.log(`🎵 Processando áudio: ${fileSizeMB.toFixed(1)}MB, ${durationMinutes.toFixed(1)} minutos`);
 
       // Usa OpenAI Whisper como método principal
@@ -426,20 +420,20 @@ export function useRecorder() {
           // Continua para Gemini como fallback
         }
       }
-      
+
       // Fallback: Usa Gemini se Groq falhar ou não estiver configurado
       console.log('📱 Usando Gemini como fallback...');
-      
+
       // Para arquivos muito grandes, usa chunks
       if (fileSizeMB > 10 || durationMinutes > 15) {
         console.log('📦 Arquivo grande detectado, processando em chunks...');
         return await transcribeAudioInChunks();
       }
-      
+
       // Para arquivos menores, usa método direto com Gemini
       const base64Audio = await blobToBase64(audioBlob.value);
       const prompt = `Você receberá o áudio de uma reunião corporativa. Faça apenas a transcrição completa e fiel em português do Brasil, corrigindo erros de dicção óbvios e removendo muletas ("éé", "ahn", "tipo"). Mantenha todos os nomes citados. Retorne apenas o texto transcrito, sem formatação adicional ou comentários.`;
-      
+
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -448,7 +442,7 @@ export function useRecorder() {
           generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
         })
       });
-      
+
       if (!response.ok) {
         const errorText = await response.text();
         console.error('Erro Gemini:', errorText);
@@ -464,18 +458,18 @@ export function useRecorder() {
           throw new Error(`Falha na transcrição Gemini: ${response.status} - ${errorText}`);
         }
       }
-      
+
       const result = await response.json();
       const transcriptText = result.candidates?.[0]?.content?.parts?.[0]?.text;
-      
+
       if (!transcriptText || !transcriptText.trim()) {
         throw new Error('Transcrição vazia retornada.');
       }
-      
+
       transcript.value = transcriptText;
       console.log('✅ Transcrição Gemini concluída');
       return transcriptText;
-      
+
     } catch (e) {
       console.error('❌ Erro na transcrição:', e);
       error.value = e.message;
@@ -568,41 +562,41 @@ export function useRecorder() {
   const transcribeAudioInChunks = async () => {
     const apiKey = GEMINI_API_KEY;
     const CHUNK_DURATION_MS = 10 * 60 * 1000; // 10 minutos por chunk
-    
+
     try {
       console.log('🔄 Processando áudio longo em chunks...');
-      
+
       const chunks = await splitAudioIntoChunks(audioBlob.value, CHUNK_DURATION_MS);
       console.log(`📦 Dividido em ${chunks.length} chunks`);
-      
+
       let fullTranscript = '';
       const prompt = `Você receberá parte do áudio de uma reunião corporativa. Faça apenas a transcrição completa e fiel em português do Brasil, corrigindo erros de dicção óbvios e removendo muletas ("éé", "ahn", "tipo"). Mantenha todos os nomes citados. Retorne apenas o texto transcrito, sem formatação adicional ou comentários.`;
-      
+
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
         const chunkSizeMB = chunk.size / (1024 * 1024);
-        
+
         console.log(`📤 Processando chunk ${i + 1}/${chunks.length} (${chunkSizeMB.toFixed(1)}MB)`);
-        
+
         try {
           let chunkTranscript = '';
-          
+
           // Se chunk ainda é muito grande, usar Files API
           if (chunkSizeMB > 10) {
             chunkTranscript = await transcribeChunkWithFilesAPI(chunk, prompt, apiKey, i + 1);
           } else {
             // Usar método inline para chunks menores
             const base64Audio = await blobToBase64(chunk);
-            
+
             const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                contents: [{ parts: [ { text: prompt }, { inline_data: { mime_type: chunk.type || 'audio/webm', data: base64Audio } } ] }],
+                contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: chunk.type || 'audio/webm', data: base64Audio } }] }],
                 generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
               })
             });
-            
+
             if (!resp.ok) {
               const errorText = await resp.text();
               console.error(`❌ Erro no chunk ${i + 1}:`, errorText);
@@ -612,31 +606,31 @@ export function useRecorder() {
               chunkTranscript = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('\n') || `[Chunk ${i + 1} vazio]`;
             }
           }
-          
+
           if (fullTranscript && chunkTranscript.trim()) {
             fullTranscript += '\n\n';
           }
           fullTranscript += chunkTranscript.trim();
-          
+
           // Pequena pausa para evitar rate limiting
           if (i < chunks.length - 1) {
             await new Promise(resolve => setTimeout(resolve, 1000));
           }
-          
+
         } catch (chunkError) {
           console.error(`❌ Erro no chunk ${i + 1}:`, chunkError);
           fullTranscript += `\n\n[Erro na transcrição do segmento ${i + 1}: ${chunkError.message}]`;
         }
       }
-      
+
       if (!fullTranscript.trim()) {
         throw new Error('Nenhuma transcrição foi obtida dos chunks.');
       }
-      
+
       transcript.value = fullTranscript;
       console.log('✅ Transcrição completa finalizada');
       return fullTranscript;
-      
+
     } catch (e) {
       console.error('❌ Erro ao processar áudio em chunks:', e);
       throw new Error(`Erro ao processar áudio longo: ${e.message}`);
@@ -648,46 +642,46 @@ export function useRecorder() {
       // 1. Upload do chunk
       const uploadData = new FormData();
       uploadData.append('file', chunk, `audio_chunk_${chunkNumber}.webm`);
-      
+
       const uploadResp = await fetch(`https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`, {
         method: 'POST',
         body: uploadData
       });
-      
+
       if (!uploadResp.ok) {
         const errorText = await uploadResp.text();
         throw new Error(`Erro no upload do chunk: ${errorText}`);
       }
-      
+
       const uploadResult = await uploadResp.json();
       const fileUri = uploadResult.file.uri;
-      
+
       // 2. Aguardar processamento
       await waitForFileProcessing(fileUri, apiKey);
-      
+
       // 3. Transcrever
       const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          contents: [{ 
+          contents: [{
             parts: [
-              { text: prompt }, 
+              { text: prompt },
               { file_data: { mime_type: chunk.type || 'audio/webm', file_uri: fileUri } }
-            ] 
+            ]
           }],
           generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
         })
       });
-      
+
       if (!resp.ok) {
         const errorText = await resp.text();
         throw new Error(`Erro na transcrição do chunk: ${errorText}`);
       }
-      
+
       const data = await resp.json();
       const transcriptText = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('\n') || '';
-      
+
       // 4. Limpar arquivo
       try {
         await fetch(`https://generativelanguage.googleapis.com/v1beta/files/${fileUri.split('/').pop()}?key=${apiKey}`, {
@@ -696,9 +690,9 @@ export function useRecorder() {
       } catch (e) {
         console.warn(`⚠️ Não foi possível remover chunk temporário ${chunkNumber}:`, e);
       }
-      
+
       return transcriptText;
-      
+
     } catch (e) {
       throw new Error(`Erro ao processar chunk ${chunkNumber}: ${e.message}`);
     }
@@ -737,7 +731,7 @@ export function useRecorder() {
         const chunkBlob = audioBlob.slice(startByte, endByte, audioBlob.type);
         chunks.push(chunkBlob);
 
-        console.log(`📦 Chunk ${i + 1}: ${startTimeSeconds.toFixed(1)}-${endTimeSeconds.toFixed(1)}s (${(chunkBlob.size/1024/1024).toFixed(1)}MB)`);
+        console.log(`📦 Chunk ${i + 1}: ${startTimeSeconds.toFixed(1)}-${endTimeSeconds.toFixed(1)}s (${(chunkBlob.size / 1024 / 1024).toFixed(1)}MB)`);
       }
 
       return chunks;
@@ -760,36 +754,36 @@ export function useRecorder() {
     const chunks = [];
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     const audioContext = new AudioContextClass();
-    
+
     try {
       // Decodifica o áudio para obter informações
       const arrayBuffer = await audioBlob.arrayBuffer();
       const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice());
-      
+
       const totalDurationMs = audioBuffer.duration * 1000;
       const numChunks = Math.ceil(totalDurationMs / chunkDurationMs);
-      
+
       console.log(`🎵 Áudio total: ${(totalDurationMs / 1000 / 60).toFixed(1)} min, dividindo em ${numChunks} chunks`);
-      
+
       // Para simplificar, vamos dividir o blob original por tempo estimado
       // (método aproximado mas funcional)
       const bytesPerMs = audioBlob.size / totalDurationMs;
-      
+
       for (let i = 0; i < numChunks; i++) {
         const startTime = i * chunkDurationMs;
         const endTime = Math.min(startTime + chunkDurationMs, totalDurationMs);
-        
+
         const startByte = Math.floor(startTime * bytesPerMs);
         const endByte = Math.floor(endTime * bytesPerMs);
-        
+
         const chunkBlob = audioBlob.slice(startByte, endByte, audioBlob.type);
         chunks.push(chunkBlob);
-        
-        console.log(`📦 Chunk ${i + 1}: ${(startTime/1000/60).toFixed(1)}-${(endTime/1000/60).toFixed(1)} min (${(chunkBlob.size/1024/1024).toFixed(1)}MB)`);
+
+        console.log(`📦 Chunk ${i + 1}: ${(startTime / 1000 / 60).toFixed(1)}-${(endTime / 1000 / 60).toFixed(1)} min (${(chunkBlob.size / 1024 / 1024).toFixed(1)}MB)`);
       }
-      
+
       return chunks;
-      
+
     } catch (e) {
       console.error('❌ Erro ao dividir áudio:', e);
       // Fallback: retorna o áudio original se falhar a divisão
@@ -803,18 +797,18 @@ export function useRecorder() {
     for (let i = 0; i < maxAttempts; i++) {
       const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/files/${fileUri.split('/').pop()}?key=${apiKey}`);
       const fileData = await resp.json();
-      
+
       if (fileData.state === 'ACTIVE') {
         console.log('✅ Arquivo processado e pronto');
         return;
       } else if (fileData.state === 'FAILED') {
         throw new Error('Falha no processamento do arquivo');
       }
-      
+
       console.log(`⏳ Aguardando processamento... (${i + 1}/${maxAttempts})`);
       await new Promise(resolve => setTimeout(resolve, 2000)); // Aguarda 2s
     }
-    
+
     throw new Error('Timeout no processamento do arquivo');
   };
 
@@ -825,9 +819,9 @@ export function useRecorder() {
     try {
       const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
       if (!apiKey) throw new Error('Chave da API ausente (.env).');
-      
+
       const prompt = `Você receberá a transcrição de uma reunião corporativa. Produza APENAS o JSON final (sem markdown, sem comentários) seguindo as regras abaixo rigorosamente.\n\nOBJETIVO: Gerar uma ATA DE REUNIÃO completa e detalhada com TODOS os pontos importantes discutidos.\n\nREGRAS:\n1. contexto: Breve contexto da reunião (1-2 frases sobre o propósito/tema principal).\n2. participantes: Array com TODOS os nomes mencionados na reunião. Se não houver nomes específicos, usar ["Participantes não identificados"].\n3. pontos_discutidos: TODOS os tópicos abordados na reunião, por ordem cronológica. Seja detalhado e completo. Cada item deve ser uma frase clara descrevendo o que foi discutido.\n4. decisoes_tomadas: Array com TODAS as decisões concretas tomadas durante a reunião. Se nenhuma decisão foi tomada, usar array vazio [].\n5. tarefas_e_acoes: TODAS as ações mencionadas, com responsável quando identificado. Formato: { "descricao": "ação específica", "responsavel": "nome ou 'A definir'", "prazo": "prazo mencionado ou 'Não definido'", "concluida": false }\n6. proximos_passos: Array com os próximos passos estratégicos mencionados.\n7. observacoes: Informações adicionais relevantes, dúvidas levantadas, ou pontos que ficaram pendentes.\n\nFORMATO EXATO DO RETORNO (JSON ÚNICO):\n{\n  "contexto": "...",\n  "participantes": ["..."],\n  "pontos_discutidos": ["..."],\n  "decisoes_tomadas": ["..."],\n  "tarefas_e_acoes": [{"descricao": "...", "responsavel": "...", "prazo": "...", "concluida": false}],\n  "proximos_passos": ["..."],\n  "observacoes": ["..."]\n}\n\nTranscrição da reunião:\n${transcript.value}\n\nRetorne somente o JSON completo e detalhado.`;
-      
+
       const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -842,7 +836,7 @@ export function useRecorder() {
       const match = raw.match(/\{[\s\S]*\}/);
       if (!match) throw new Error('JSON não encontrado na resposta da IA.');
       const parsed = JSON.parse(match[0]);
-      
+
       return {
         contexto: parsed.contexto || '',
         participantes: parsed.participantes || ['Participantes não identificados'],
@@ -935,9 +929,14 @@ export function useRecorder() {
     setupElectronListener();
   });
 
-  onUnmounted(() => {
-    if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
-    if (removeElectronListener) removeElectronListener();
+  onUnmounted(async () => {
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+      mediaRecorder.stop();
+    }
+    if (removeElectronListener) {
+      removeElectronListener();
+    }
+    await cleanupStreams();
   });
 
   return {

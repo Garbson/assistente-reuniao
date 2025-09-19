@@ -1,5 +1,7 @@
 // preload.js
-const { contextBridge, ipcRenderer, desktopCapturer } = require('electron');
+const { contextBridge, ipcRenderer } = require('electron');
+
+console.log('✅ Preload iniciado - Electron v', process.versions.electron);
 
 // Expõe APIs seguras para a interface Vue.js
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -9,13 +11,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
       // Chama o callback passando os dados da reunião detectada
       callback(data);
     };
-    
+
     // Registra o listener para o canal especificado
-    ipcRenderer.on('start-recording-from-main', handleStartRecording);
-    
+    ipcRenderer.on('start-recording', handleStartRecording);
+
     // Retorna função de limpeza para remover o listener
     return () => {
-      ipcRenderer.removeListener('start-recording-from-main', handleStartRecording);
+      ipcRenderer.removeListener('start-recording', handleStartRecording);
     };
   },
 
@@ -49,35 +51,66 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Injetar dados de reunião no localStorage
   injectMeetingData: (meetingData) => ipcRenderer.invoke('inject-meeting-data', meetingData),
 
-  // Desktop Capturer para captura de áudio do sistema
-  getDesktopCapturer: async (types = ['screen', 'window']) => {
+  // Captura de áudio do sistema - MÉTODO EXATO DO NOTION (Loopback Audio)
+  captureSystemAudio: async () => {
     try {
-      // Verifica se desktopCapturer está disponível
-      if (typeof desktopCapturer === 'undefined' || !desktopCapturer) {
-        console.warn('desktopCapturer não está disponível nesta versão do Electron');
-        return [];
-      }
+      console.log('🎵 Capturando áudio do sistema (método LOOPBACK como Notion)...');
 
-      const sources = await desktopCapturer.getSources({
-        types: types,
-        thumbnailSize: { width: 150, height: 150 },
-        fetchWindowIcons: false
+      // MÉTODO EXATO DO NOTION: getDisplayMedia apenas com áudio
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: false,  // Notion NÃO pede tela!
+        audio: true    // Apenas áudio do sistema (loopback será fornecido pelo handler)
       });
 
-      console.log(`📺 ${sources.length} fontes de captura encontradas`);
-      return sources;
+      console.log('✅ Stream de áudio obtido via getDisplayMedia (método Notion)');
+      console.log('🎵 Audio tracks:', stream.getAudioTracks().length);
+
+      // Verificar se tem áudio
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length > 0) {
+        console.log('🔊 Tracks de áudio detectados:');
+        audioTracks.forEach((track, i) => {
+          console.log(`  ${i + 1}. ${track.label} (tipo: ${track.kind})`);
+        });
+
+        return stream;
+      } else {
+        throw new Error('Nenhum áudio do sistema disponível - handler loopback pode não estar funcionando');
+      }
     } catch (error) {
-      console.warn('Desktop capture não disponível:', error.message);
-      return []; // Retorna array vazio em vez de throw para não quebrar o app
+      console.error('❌ Erro na captura loopback:', error.message);
+      throw error;
     }
   },
 
-  // Verificar se desktop capturer está disponível
-  hasDesktopCapture: () => {
-    return typeof desktopCapturer !== 'undefined' && !!desktopCapturer;
+  // Desktop Capturer para captura de áudio do sistema (BACKUP)
+  getDesktopCapturer: async (types = ['screen', 'window']) => {
+    try {
+      console.log('🔍 Obtendo fontes via IPC...');
+
+      const sources = await ipcRenderer.invoke('get-desktop-sources', types);
+
+      console.log(`✅ ${sources.length} fontes recebidas`);
+      return sources;
+    } catch (error) {
+      console.error('❌ Erro ao obter fontes:', error.message);
+      return [];
+    }
+  },
+
+  // Verificar se desktop capturer está disponível (via IPC)
+  hasDesktopCapture: async () => {
+    try {
+      const isAvailable = await ipcRenderer.invoke('has-desktop-capture');
+      console.log('🔍 Desktop Capturer disponível:', isAvailable);
+      return isAvailable;
+    } catch (error) {
+      console.error('❌ Erro ao verificar Desktop Capturer:', error.message);
+      return false;
+    }
   }
 });
 
-console.log('Script de pré-carregamento executado! API exposta:', Object.keys(window.electronAPI || {}));
+console.log('🚀 Preload concluído - APIs expostas');
 
 

@@ -37,66 +37,145 @@ const isTesting = ref(false);
 const testResults = ref([]);
 
 const testAllCaptureMethods = async () => {
+  console.log('🧪 Iniciando testes de captura (SEGURO)...');
+
   isTesting.value = true;
   testResults.value = [];
 
-  // Teste 1: Desktop Capturer (Electron)
-  await testDesktopCapturer();
+  try {
+    // Teste 1: Desktop Capturer (Electron) - COM TIMEOUT
+    await safeTest('Desktop Capturer', testDesktopCapturer);
 
-  // Teste 2: getDisplayMedia híbrido
-  await testDisplayMedia();
+    // Teste 2: getUserMedia microfone - SIMPLIFICADO
+    await safeTest('Microfone', testMicrophone);
 
-  // Teste 3: getUserMedia microfone
-  await testMicrophone();
+    // Teste 3: Verificar permissões
+    await safeTest('Permissões', testPermissions);
 
-  // Teste 4: Verificar permissões
-  await testPermissions();
+    // REMOVIDO: getDisplayMedia porque pode causar crashes
 
-  isTesting.value = false;
+  } catch (globalError) {
+    console.error('❌ Erro global nos testes:', globalError);
+    testResults.value.push({
+      method: '❌ Erro Global',
+      success: false,
+      message: `Teste interrompido: ${globalError.message}`
+    });
+  } finally {
+    isTesting.value = false;
+  }
+};
+
+// Função wrapper para executar testes com timeout e proteção
+const safeTest = async (testName, testFunction) => {
+  try {
+    console.log(`🧪 Testando ${testName}...`);
+
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`Timeout em ${testName}`)), 10000);
+    });
+
+    await Promise.race([testFunction(), timeoutPromise]);
+
+  } catch (error) {
+    console.warn(`⚠️ ${testName} falhou:`, error.message);
+    testResults.value.push({
+      method: `❌ ${testName}`,
+      success: false,
+      message: `Erro: ${error.message}`
+    });
+  }
 };
 
 const testDesktopCapturer = async () => {
+  console.log('🧪 SKIP: Desktop Capturer temporariamente desabilitado para evitar crashes');
+
+  testResults.value.push({
+    method: '🖥️ Desktop Capturer (TEMPORARIAMENTE DESABILITADO)',
+    success: false,
+    message: '⚠️ Desabilitado temporariamente - usando getDisplayMedia'
+  });
+  return;
+
   try {
-    if (window.electronAPI?.getDesktopCapturer) {
-      const sources = await window.electronAPI.getDesktopCapturer(['screen', 'window']);
+    // Timeout específico para Desktop Capturer
+    const sourcesPromise = window.electronAPI.getDesktopCapturer(['screen', 'window']);
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Timeout ao buscar fontes')), 5000);
+    });
 
-      if (sources && sources.length > 0) {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            mandatory: {
-              chromeMediaSource: 'desktop',
-              chromeMediaSourceId: sources[0].id
-            }
-          },
-          video: false
-        });
+    const sources = await Promise.race([sourcesPromise, timeoutPromise]);
 
-        const audioTracks = stream.getAudioTracks();
-        stream.getTracks().forEach(track => track.stop());
-
-        testResults.value.push({
-          method: '🖥️ Desktop Capturer (Electron)',
-          success: audioTracks.length > 0,
-          message: audioTracks.length > 0
-            ? `✅ Funcionou! ${audioTracks.length} track(s) de áudio`
-            : '❌ Sem tracks de áudio',
-          details: audioTracks.length > 0 ? `Label: ${audioTracks[0].label}` : null
-        });
-      } else {
-        testResults.value.push({
-          method: '🖥️ Desktop Capturer (Electron)',
-          success: false,
-          message: '❌ Nenhuma fonte de captura encontrada'
-        });
-      }
-    } else {
+    if (!sources || sources.length === 0) {
       testResults.value.push({
         method: '🖥️ Desktop Capturer (Electron)',
         success: false,
-        message: '❌ API não disponível'
+        message: '❌ Nenhuma fonte de captura encontrada'
+      });
+      return;
+    }
+
+    console.log(`🧪 ${sources.length} fontes encontradas, testando primeira...`);
+
+    // TESTE SUPER SEGURO: Tenta apenas a primeira fonte com proteções extremas
+    console.log(`🧪 ${sources.length} fontes encontradas, testando primeira com proteções...`);
+
+    try {
+      // Proteção extrema: timeout muito curto e validação rápida
+      const capturePromise = navigator.mediaDevices.getUserMedia({
+        audio: {
+          mandatory: {
+            chromeMediaSource: 'desktop',
+            chromeMediaSourceId: sources[0].id
+          }
+        },
+        video: false
+      });
+
+      const testTimeout = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Timeout teste (1.5s)')), 1500);
+      });
+
+      console.log('⏱️ Teste com timeout ultra-curto (1.5s)...');
+      const stream = await Promise.race([capturePromise, testTimeout]);
+
+      // Validação imediata e cleanup
+      const audioTracks = stream.getAudioTracks();
+      const hasAudio = audioTracks.length > 0;
+
+      console.log(`🔍 Resultado: ${hasAudio ? 'COM áudio' : 'SEM áudio'}`);
+
+      // Cleanup super rápido
+      stream.getTracks().forEach(track => {
+        if (track.readyState !== 'ended') {
+          track.stop();
+        }
+      });
+
+      testResults.value.push({
+        method: '🖥️ Desktop Capturer (Electron)',
+        success: hasAudio,
+        message: hasAudio
+          ? `✅ Funcionou! ${audioTracks.length} track(s) de áudio`
+          : '⚠️ Fonte sem áudio (apenas vídeo)',
+        details: hasAudio ? `Fonte: ${sources[0].name}` : `Testada: ${sources[0].name}`
+      });
+
+    } catch (testError) {
+      console.warn('⚠️ Teste rápido falhou:', testError.message);
+
+      // Se teste rápido falhar, mostra info das fontes
+      const sourceNames = sources.slice(0, 3).map(s => s.name).join(', ');
+      testResults.value.push({
+        method: '🖥️ Desktop Capturer (Electron)',
+        success: false,
+        message: `⚠️ Teste falhou: ${testError.message}`,
+        details: `${sources.length} fontes: ${sourceNames}${sources.length > 3 ? '...' : ''}`
       });
     }
+
   } catch (error) {
+    console.warn('⚠️ Desktop Capturer falhou:', error.message);
     testResults.value.push({
       method: '🖥️ Desktop Capturer (Electron)',
       success: false,
@@ -105,57 +184,49 @@ const testDesktopCapturer = async () => {
   }
 };
 
-const testDisplayMedia = async () => {
+// REMOVIDO: testDisplayMedia porque pode causar crashes no Electron
+
+const testMicrophone = async () => {
+  console.log('🧪 Testando microfone...');
+
   try {
-    const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
+    // Teste SIMPLES do microfone com timeout
+    const streamPromise = navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
       }
     });
 
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Timeout no microfone')), 5000);
+    });
+
+    const stream = await Promise.race([streamPromise, timeoutPromise]);
+
+    // Verificação RÁPIDA
     const audioTracks = stream.getAudioTracks();
-    const videoTracks = stream.getVideoTracks();
+    const hasAudio = audioTracks.length > 0;
 
-    stream.getTracks().forEach(track => track.stop());
-
-    testResults.value.push({
-      method: '🖥️ getDisplayMedia (Compartilhar Tela)',
-      success: audioTracks.length > 0,
-      message: audioTracks.length > 0
-        ? `✅ Funcionou! Vídeo: ${videoTracks.length}, Áudio: ${audioTracks.length}`
-        : `❌ Só vídeo (${videoTracks.length}), sem áudio`,
-      details: audioTracks.length > 0 ? `Audio Label: ${audioTracks[0].label}` : null
+    // Cleanup imediato
+    stream.getTracks().forEach(track => {
+      if (track.readyState !== 'ended') {
+        track.stop();
+      }
     });
-  } catch (error) {
-    testResults.value.push({
-      method: '🖥️ getDisplayMedia (Compartilhar Tela)',
-      success: false,
-      message: `❌ Erro: ${error.message}`
-    });
-  }
-};
-
-const testMicrophone = async () => {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: true
-    });
-
-    const audioTracks = stream.getAudioTracks();
-    stream.getTracks().forEach(track => track.stop());
 
     testResults.value.push({
       method: '🎤 getUserMedia (Microfone)',
-      success: audioTracks.length > 0,
-      message: audioTracks.length > 0
+      success: hasAudio,
+      message: hasAudio
         ? `✅ Funcionou! ${audioTracks.length} track(s)`
         : '❌ Sem acesso ao microfone',
-      details: audioTracks.length > 0 ? `Label: ${audioTracks[0].label}` : null
+      details: hasAudio ? `Device: ${audioTracks[0].label || 'Microfone padrão'}` : null
     });
+
   } catch (error) {
+    console.warn('⚠️ Microfone falhou:', error.message);
     testResults.value.push({
       method: '🎤 getUserMedia (Microfone)',
       success: false,
@@ -165,20 +236,39 @@ const testMicrophone = async () => {
 };
 
 const testPermissions = async () => {
+  console.log('🧪 Testando permissões...');
+
   try {
-    const micPermission = await navigator.permissions.query({ name: 'microphone' });
+    // Verificação simples de APIs disponíveis
+    const hasMediaDevices = !!navigator.mediaDevices;
+    const hasGetUserMedia = !!navigator.mediaDevices?.getUserMedia;
+    const hasMediaRecorder = !!window.MediaRecorder;
+
+    let permissionState = 'unknown';
+    try {
+      if (navigator.permissions) {
+        const micPermission = await navigator.permissions.query({ name: 'microphone' });
+        permissionState = micPermission.state;
+      }
+    } catch (permError) {
+      console.warn('⚠️ Permissions API não disponível:', permError.message);
+    }
+
+    const allGood = hasMediaDevices && hasGetUserMedia && hasMediaRecorder;
 
     testResults.value.push({
-      method: '🔐 Permissões do Sistema',
-      success: micPermission.state === 'granted',
-      message: `Microfone: ${micPermission.state}`,
-      details: `Estado: ${micPermission.state} (granted/denied/prompt)`
+      method: '🔐 APIs e Permissões',
+      success: allGood,
+      message: allGood ? '✅ Todas as APIs disponíveis' : '❌ APIs em falta',
+      details: `MediaDevices: ${hasMediaDevices ? '✅' : '❌'}, getUserMedia: ${hasGetUserMedia ? '✅' : '❌'}, MediaRecorder: ${hasMediaRecorder ? '✅' : '❌'}, Permissão: ${permissionState}`
     });
+
   } catch (error) {
+    console.warn('⚠️ Teste de permissões falhou:', error.message);
     testResults.value.push({
-      method: '🔐 Permissões do Sistema',
+      method: '🔐 APIs e Permissões',
       success: false,
-      message: `❌ Erro ao verificar: ${error.message}`
+      message: `❌ Erro: ${error.message}`
     });
   }
 };

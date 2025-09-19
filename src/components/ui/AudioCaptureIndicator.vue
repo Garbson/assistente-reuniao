@@ -9,7 +9,7 @@
       <!-- Ícone -->
       <div :class="iconClasses">
         <svg
-          v-if="captureType === 'system'"
+          v-if="captureType === 'system' || captureType === 'notion'"
           class="w-4 h-4"
           fill="none"
           stroke="currentColor"
@@ -53,7 +53,7 @@ const props = defineProps({
   captureType: {
     type: String,
     required: true,
-    validator: (value) => ['system', 'microphone', 'hybrid', 'unknown'].includes(value)
+    validator: (value) => ['system', 'microphone', 'hybrid', 'notion', 'unknown'].includes(value)
   },
   isCapturingFullMeeting: {
     type: Boolean,
@@ -81,6 +81,8 @@ const indicatorClasses = computed(() => {
   switch (props.captureType) {
     case 'system':
       return 'bg-green-100 text-green-800 border border-green-200';
+    case 'notion':
+      return 'bg-emerald-100 text-emerald-800 border border-emerald-200';
     case 'hybrid':
       return 'bg-blue-100 text-blue-800 border border-blue-200';
     case 'microphone':
@@ -94,6 +96,8 @@ const iconClasses = computed(() => {
   switch (props.captureType) {
     case 'system':
       return 'text-green-600';
+    case 'notion':
+      return 'text-emerald-600';
     case 'hybrid':
       return 'text-blue-600';
     case 'microphone':
@@ -109,6 +113,8 @@ const title = computed(() => {
   switch (props.captureType) {
     case 'system':
       return inputOutput ? '👥🔊 Sistema + Entrada' : '👥 Sistema';
+    case 'notion':
+      return '🎯 Captura Completa (Notion)';
     case 'hybrid':
       return '🔄 Captura Híbrida';
     case 'microphone':
@@ -126,6 +132,8 @@ const subtitle = computed(() => {
   switch (props.captureType) {
     case 'system':
       return 'Capturando áudio do sistema' + qualityInfo;
+    case 'notion':
+      return 'Microfone + Sistema mixados' + qualityInfo;
     case 'hybrid':
       return 'Tentando captura de sistema' + qualityInfo;
     case 'microphone':

@@ -43,11 +43,15 @@
 
     <!-- Conteúdo principal -->
     <div class="flex-1 overflow-y-auto p-6">
-      <!-- Setup do BlackHole para captura completa -->
-      <BlackHoleSetup v-if="!isRecording" @blackhole-configured="onBlackHoleConfigured" />
 
       <!-- Botão de teste de captura de áudio -->
       <AudioTestButton v-if="!isRecording" />
+
+      <!-- Guia de configuração do Stereo Mix -->
+      <StereoMixGuide
+        v-if="showStereoMixGuide && !isRecording"
+        @close="showStereoMixGuide = false"
+      />
 
 
       <!-- Alerts -->
@@ -65,36 +69,28 @@
         message="Nenhuma API de áudio está disponível. Verifique permissões do sistema e reinicie o aplicativo."
       />
 
-      <!-- Alerta específico para Teams -->
+      <!-- Alerta quando captura completa está ativa -->
       <AlertBox
-        v-if="isRecording && !isCapturingOutput && audioCaptureType === 'microphone' && detectedMeetingApp.includes('Teams')"
-        type="warning"
-        title="🏢 Microsoft Teams - Instruções Especiais"
-        message="O Teams detectado está bloqueando captura de áudio. SOLUÇÃO: 1) Pare a gravação 2) Inicie novamente 3) Quando aparecer o popup, escolha 'Compartilhar Tela' 4) MARQUE 'Compartilhar áudio do sistema' 5) Selecione a tela/janela do Teams."
-      />
-
-      <!-- Alerta genérico para outros casos -->
-      <AlertBox
-        v-if="isRecording && !isCapturingOutput && audioCaptureType === 'microphone' && !detectedMeetingApp.includes('Teams')"
-        type="warning"
-        title="⚠️ Capturando apenas sua voz"
-        message="O áudio dos outros participantes não está sendo capturado. Para gravar reuniões completas, use compartilhamento de tela com áudio ou configure um dispositivo de áudio virtual."
-      />
-
-      <!-- Alerta quando captura híbrida pode não estar funcionando -->
-      <AlertBox
-        v-if="isRecording && audioCaptureType === 'hybrid' && !isCapturingOutput && audioQuality.input === 0"
-        type="warning"
-        title="🔄 Verificando captura híbrida"
-        message="Tentando capturar áudio do sistema. Se não funcionar, será usado apenas o microfone."
-      />
-
-      <!-- Alerta positivo quando está capturando entrada + saída -->
-      <AlertBox
-        v-if="isRecording && isCapturingInput && isCapturingOutput"
+        v-if="isRecording && audioCaptureType === 'system'"
         type="success"
         title="✅ Captura completa ativa"
-        message="Gravando tanto sua voz quanto o áudio dos outros participantes."
+        message="Gravando TODO o áudio do sistema - sua voz + áudio dos outros participantes."
+      />
+
+      <!-- Alerta quando captura Notion está ativa -->
+      <AlertBox
+        v-if="isRecording && audioCaptureType === 'notion'"
+        type="success"
+        title="🎯 Captura igual ao Notion ativa"
+        message="Gravando microfone + sistema mixados em uma única transcrição - sua voz + todos os participantes."
+      />
+
+      <!-- Alerta quando apenas microfone -->
+      <AlertBox
+        v-if="isRecording && audioCaptureType === 'microphone'"
+        type="warning"
+        title="⚠️ Apenas microfone detectado"
+        message="Capturando apenas sua voz. Desktop Capturer não conseguiu acessar o áudio do sistema."
       />
 
       <!-- Status da API - Simplificado -->
@@ -149,8 +145,8 @@ import TranscriptDisplay from "./recorder/TranscriptDisplay.vue";
 import AlertBox from "./ui/AlertBox.vue";
 import AudioCaptureIndicator from "./ui/AudioCaptureIndicator.vue";
 import AudioTestButton from "./ui/AudioTestButton.vue";
-import BlackHoleSetup from "./ui/BlackHoleSetup.vue";
 import StatusIndicator from "./ui/StatusIndicator.vue";
+import StereoMixGuide from "./ui/StereoMixGuide.vue";
 
 // Emits
 const emit = defineEmits(["summary-generated"]);
@@ -188,6 +184,7 @@ const { apiStatus } = useConfig();
 
 // Estado local
 const recordingDuration = ref(0);
+const showStereoMixGuide = ref(false);
 let durationInterval = null;
 
 // Listener para iniciar gravação automaticamente (nova implementação)
@@ -234,12 +231,28 @@ onUnmounted(() => {
 
 // Métodos
 const startRecording = async () => {
-  await startRec();
-  if (isRecording.value) {
+  try {
+    console.log('🔴 [RecorderView] Iniciando gravação...');
+
+    // Reset do estado antes de iniciar
+    error.value = null;
     recordingDuration.value = 0;
-    durationInterval = setInterval(() => {
-      recordingDuration.value++;
-    }, 1000);
+
+    // Chama a função do composable
+    await startRec();
+
+    if (isRecording.value) {
+      console.log('✅ [RecorderView] Gravação iniciada, configurando timer...');
+      recordingDuration.value = 0;
+      durationInterval = setInterval(() => {
+        recordingDuration.value++;
+      }, 1000);
+    } else {
+      console.warn('⚠️ [RecorderView] Gravação não iniciou (isRecording ainda false)');
+    }
+  } catch (startError) {
+    console.error('❌ [RecorderView] Erro ao iniciar gravação:', startError);
+    error.value = `Erro ao iniciar: ${startError.message}`;
   }
 };
 
@@ -344,17 +357,6 @@ const saveWithoutSummary = () => {
   }
 };
 
-const onBlackHoleConfigured = (deviceInfo) => {
-  console.log('✅ BlackHole configurado:', deviceInfo);
-
-  // Notificação de sucesso
-  if (window.electronAPI?.showNotification) {
-    window.electronAPI.showNotification(
-      "BlackHole Configurado",
-      `${deviceInfo.label} pronto para captura completa!`
-    );
-  }
-};
 
 
 // Watchers

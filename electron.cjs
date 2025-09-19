@@ -80,7 +80,7 @@ async function detectTeamsPresence() {
         });
         return;
       }
-      
+
       // Teams novo encontrado, verifica registry para status (simplificado)
       exec('reg query "HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Office\\Teams" /v PresenceState 2>nul', (regErr, regOut) => {
         let status = 'available';
@@ -101,17 +101,17 @@ async function detectTeamsPresence() {
 async function isMicrophoneInUse() {
   return new Promise((resolve) => {
     // Windows: verifica processos usando áudio
-    exec('powershell "Get-Counter \\"\\\\Process(*)\\\\% Processor Time\\" | Select-Object -ExpandProperty CounterSamples | Where-Object {$_.InstanceName -match \\"teams|zoom|chrome|msedge\\"} | Select-Object InstanceName"', 
-    { timeout: 3000 }, (err, stdout) => {
-      if (err) {
-        resolve(false);
-        return;
-      }
-      // Se encontrar processos de reunião ativos, provável que mic esteja em uso
-      const hasActiveProcesses = stdout.includes('teams') || stdout.includes('zoom') || 
-                                stdout.includes('chrome') || stdout.includes('msedge');
-      resolve(hasActiveProcesses);
-    });
+    exec('powershell "Get-Counter \\"\\\\Process(*)\\\\% Processor Time\\" | Select-Object -ExpandProperty CounterSamples | Where-Object {$_.InstanceName -match \\"teams|zoom|chrome|msedge\\"} | Select-Object InstanceName"',
+      { timeout: 3000 }, (err, stdout) => {
+        if (err) {
+          resolve(false);
+          return;
+        }
+        // Se encontrar processos de reunião ativos, provável que mic esteja em uso
+        const hasActiveProcesses = stdout.includes('teams') || stdout.includes('zoom') ||
+          stdout.includes('chrome') || stdout.includes('msedge');
+        resolve(hasActiveProcesses);
+      });
   });
 }
 
@@ -139,23 +139,23 @@ function isMeetingWindow(windowTitle, processName = '', url = '') {
   const title = windowTitle.toLowerCase();
   const process = processName.toLowerCase();
   const urlLower = url.toLowerCase();
-  
+
   // Verifica keywords no título
   const hasKeyword = MEETING_KEYWORDS.some(keyword =>
     title.includes(keyword.toLowerCase())
   );
-  
+
   // Verifica URLs de reunião
   const hasMeetingUrl = MEETING_URLs.some(meetingUrl =>
     urlLower.includes(meetingUrl)
   );
-  
+
   // Verifica processos específicos + contexto
-  const isMeetingProcess = MEETING_PROCESSES.includes(process) && 
-    (hasKeyword || hasMeetingUrl || 
-     title.includes('reunião') || title.includes('meeting') || 
-     title.includes('chamada') || title.includes('call'));
-  
+  const isMeetingProcess = MEETING_PROCESSES.includes(process) &&
+    (hasKeyword || hasMeetingUrl ||
+      title.includes('reunião') || title.includes('meeting') ||
+      title.includes('chamada') || title.includes('call'));
+
   return hasKeyword || hasMeetingUrl || isMeetingProcess;
 }
 
@@ -165,7 +165,7 @@ async function monitorActiveWindows() {
     // 1. Verifica status do Teams primeiro
     const teamsStatus = await detectTeamsPresence();
     teamsPresenceStatus = teamsStatus.status;
-    
+
     // Se Teams indica reunião ativa, dispara imediatamente
     if (teamsStatus.status === 'in_meeting' || teamsStatus.status === 'busy') {
       const meetingTitle = 'Microsoft Teams - Reunião em andamento';
@@ -176,12 +176,12 @@ async function monitorActiveWindows() {
       }
       return;
     }
-    
+
     // 2. Verifica janela ativa
     const activeWindow = await getActiveWindow();
     const title = (activeWindow && activeWindow.title) ? activeWindow.title.trim() : '';
     const processName = activeWindow.processName || '';
-    
+
     if (!title) {
       isInMeeting = false;
       return; // nada a avaliar
@@ -247,7 +247,12 @@ function showMeetingNotification(windowTitle) {
     if (index === 0) { // Iniciar Gravação
       // Envia comando para a interface Vue.js
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('start-recording');
+        mainWindow.webContents.send('start-recording', {
+          app: 'Microsoft Teams',
+          title: meetingTitle,
+          timestamp: Date.now(),
+          detectionMethod: 'teams_presence'
+        });
         mainWindow.focus(); // Traz a janela para frente
       }
     }
@@ -289,7 +294,7 @@ function showOverlayReminder(meetingTitle) {
     webPreferences: { contextIsolation: true }
   });
 
-  const safeTitle = meetingTitle.replace(/"/g,'&quot;').slice(0,80);
+  const safeTitle = meetingTitle.replace(/"/g, '&quot;').slice(0, 80);
   const html = `<!DOCTYPE html><html><head><meta charset='utf-8'>
   <style>
   body{margin:0;font-family:system-ui,Arial} .card{backdrop-filter:blur(8px);background:rgba(15,23,42,.82);color:#fff;padding:16px 18px;border-radius:18px;width:100%;height:100%;box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;font-size:14px}
@@ -313,10 +318,10 @@ function showOverlayReminder(meetingTitle) {
    </div>
    <script>window.addEventListener('message',e=>{ if(e.data==='start-rec'){ /* placeholder */ }});</script>
   </body></html>`;
-  overlayWindow.loadURL('data:text/html;charset=utf-8,'+encodeURIComponent(html));
+  overlayWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
 
   // Fecha automático após 25s
-  setTimeout(()=>{ if(overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.close(); },25000);
+  setTimeout(() => { if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.close(); }, 25000);
 
   // Canal para clicar em Gravar: escuta eventos de console (hack simples) via polling
   // Alternativamente poderíamos usar ipc da preload se empacotássemos arquivo.
@@ -329,12 +334,17 @@ function showOverlayReminder(meetingTitle) {
     document.querySelector('button.primary').addEventListener('click',()=>{
       require('electron').ipcRenderer.send('overlay-start-recording');
     });
-  `).catch(()=>{});
+  `).catch(() => { });
 }
 
 ipcMain.on('overlay-start-recording', () => {
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('start-recording');
+    mainWindow.webContents.send('start-recording', {
+      app: lastMeetingTitle.includes('Teams') ? 'Microsoft Teams' : 'Reunião detectada',
+      title: lastMeetingTitle,
+      timestamp: Date.now(),
+      detectionMethod: 'overlay_click'
+    });
     mainWindow.focus();
   }
   if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.close();
@@ -373,13 +383,25 @@ function createWindow() {
       // e usar o preload.js para expor funcionalidades específicas.
       nodeIntegration: false,
       contextIsolation: true,
-      // Habilitar desktopCapturer
+      // Habilitar desktopCapturer para captura de áudio/tela
       enableRemoteModule: false,
-      webSecurity: false, // Necessário para captura de tela em desenvolvimento
+      // Configurações mínimas para desenvolvimento
+      webSecurity: true,
+      // Permitir acesso a recursos de mídia
+      allowRunningInsecureContent: false,
     },
     icon: path.join(__dirname, 'public/favicon.ico'),
     titleBarStyle: 'default',
     show: false, // Não mostra a janela imediatamente
+  });
+
+  // Tratamento de erro para carregar a página
+  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
+    console.error('❌ Falha ao carregar página:', errorCode, errorDescription);
+  });
+
+  mainWindow.webContents.on('crashed', (event, killed) => {
+    console.error('❌ Processo renderer crashou! Killed:', killed);
   });
 
   // Carrega a URL do servidor de desenvolvimento do Vite (para desenvolvimento)
@@ -435,6 +457,195 @@ ipcMain.handle('open-external', (event, url) => {
   shell.openExternal(url);
 });
 
+// FUNÇÃO ULTRA-SEGURA PARA SANITIZAR DADOS IPC
+function sanitizeForIPC(data, maxStringLength = 200) {
+  if (data === null || data === undefined) {
+    return null;
+  }
+
+  if (typeof data === 'string') {
+    // Limita tamanho e remove caracteres problemáticos
+    return data.slice(0, maxStringLength).replace(/[\x00-\x1F\x7F-\x9F]/g, '');
+  }
+
+  if (typeof data === 'number' || typeof data === 'boolean') {
+    return data;
+  }
+
+  if (Array.isArray(data)) {
+    return data.slice(0, 50).map(item => sanitizeForIPC(item, maxStringLength));
+  }
+
+  if (typeof data === 'object') {
+    const sanitized = {};
+    const allowedKeys = ['id', 'name', 'type']; // Apenas propriedades conhecidas
+
+    for (const key of allowedKeys) {
+      if (data[key] !== undefined) {
+        sanitized[key] = sanitizeForIPC(data[key], maxStringLength);
+      }
+    }
+    return sanitized;
+  }
+
+  return null; // Remove qualquer tipo não suportado
+}
+
+// FUNÇÃO PARA VALIDAR DADOS JSON
+function validateJSONSerializable(data) {
+  try {
+    const serialized = JSON.stringify(data);
+    if (serialized.length > 100000) { // Limite de 100KB
+      throw new Error('Dados muito grandes para IPC');
+    }
+    JSON.parse(serialized); // Verifica se pode ser deserializado
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+// Handlers para Desktop Capturer - ULTRA SEGURO COM SANITIZAÇÃO COMPLETA
+ipcMain.handle('get-desktop-sources', async (event, types = ['screen', 'window']) => {
+  try {
+    console.log('🔍 Main: [ULTRA-SEGURO] Obtendo fontes de desktop...');
+
+    // Validação de ambiente
+    if (!process.versions.electron) {
+      console.log('❌ Main: Não está no Electron');
+      return [];
+    }
+
+    const electron = require('electron');
+    if (!electron.desktopCapturer) {
+      console.log('❌ Main: desktopCapturer não disponível');
+      return [];
+    }
+
+    // Timeout para evitar travamentos
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Timeout ao obter fontes')), 10000);
+    });
+
+    const getSourcesPromise = electron.desktopCapturer.getSources({
+      types: types,
+      thumbnailSize: { width: 1, height: 1 }, // Mínimo possível
+      fetchWindowIcons: false // Não buscar ícones para evitar dados grandes
+    });
+
+    console.log('⏱️ Main: Obtendo fontes com timeout de 10s...');
+    const sources = await Promise.race([getSourcesPromise, timeoutPromise]);
+
+    if (!sources || !Array.isArray(sources)) {
+      console.log('⚠️ Main: Fontes inválidas recebidas');
+      return [];
+    }
+
+    console.log(`✅ Main: ${sources.length} fontes brutas encontradas`);
+
+    // SANITIZAÇÃO ULTRA-RIGOROSA
+    const sanitizedSources = [];
+
+    for (let i = 0; i < Math.min(sources.length, 20); i++) { // Máximo 20 fontes
+      const source = sources[i];
+
+      try {
+        // Criar objeto completamente limpo
+        const cleanSource = {
+          id: '',
+          name: '',
+          type: ''
+        };
+
+        // Sanitizar cada propriedade individualmente
+        if (source && typeof source.id === 'string') {
+          cleanSource.id = source.id.slice(0, 100).replace(/[^\w\-:]/g, '');
+        }
+
+        if (source && typeof source.name === 'string') {
+          cleanSource.name = source.name.slice(0, 100).replace(/[\x00-\x1F\x7F-\x9F]/g, '').trim();
+        }
+
+        if (source && typeof source.type === 'string') {
+          cleanSource.type = source.type.slice(0, 20).replace(/[^\w]/g, '');
+        }
+
+        // Validação final
+        if (cleanSource.id && cleanSource.name && validateJSONSerializable(cleanSource)) {
+          sanitizedSources.push(cleanSource);
+        } else {
+          console.log(`⚠️ Main: Fonte ${i} descartada por falha na validação`);
+        }
+
+      } catch (sourceError) {
+        console.log(`⚠️ Main: Erro ao processar fonte ${i}:`, sourceError.message);
+      }
+    }
+
+    console.log(`📋 Main: ${sanitizedSources.length} fontes sanitizadas processadas`);
+
+    // Validação final dos dados completos
+    if (!validateJSONSerializable(sanitizedSources)) {
+      console.log('❌ Main: Dados finais não passaram na validação JSON');
+      return [];
+    }
+
+    console.log('✅ Main: Dados validados e prontos para IPC');
+    return sanitizedSources;
+
+  } catch (error) {
+    console.error('❌ Main: Erro ao obter fontes:', {
+      message: error.message?.slice(0, 200) || 'Erro desconhecido',
+      type: error.constructor?.name || 'Error'
+    });
+    return [];
+  }
+});
+
+ipcMain.handle('has-desktop-capture', async () => {
+  try {
+    console.log('🔍 Main: [ULTRA-SEGURO] Verificando Desktop Capturer...');
+
+    // Verificações básicas
+    if (!process.versions.electron) {
+      console.log('❌ Main: Não está no Electron');
+      return false;
+    }
+
+    const electron = require('electron');
+    if (!electron.desktopCapturer) {
+      console.log('❌ Main: desktopCapturer não disponível');
+      return false;
+    }
+
+    // Teste rápido com timeout
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Timeout verificação')), 5000);
+    });
+
+    const testPromise = electron.desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: 1, height: 1 },
+      fetchWindowIcons: false
+    });
+
+    console.log('⏱️ Main: Teste com timeout de 5s...');
+    const testSources = await Promise.race([testPromise, timeoutPromise]);
+
+    const isAvailable = testSources && Array.isArray(testSources) && testSources.length > 0;
+    console.log(`🔍 Main: Desktop Capturer ${isAvailable ? 'DISPONÍVEL' : 'INDISPONÍVEL'} (${testSources?.length || 0} fontes)`);
+
+    return isAvailable;
+
+  } catch (error) {
+    console.error('❌ Main: Erro ao verificar Desktop Capturer:', {
+      message: error.message?.slice(0, 100) || 'Erro desconhecido',
+      type: error.constructor?.name || 'Error'
+    });
+    return false;
+  }
+});
+
 
 // Handler para debug de reuniões (corrige o erro no Sidebar)
 ipcMain.handle('get-meeting-debug', () => {
@@ -472,7 +683,7 @@ ipcMain.handle('inject-meeting-data', async (event, meetingData) => {
         false;
       }
     `);
-    
+
     return { success: true };
   } catch (error) {
     console.error('❌ Erro ao injetar dados:', error);
@@ -484,25 +695,69 @@ ipcMain.handle('inject-meeting-data', async (event, meetingData) => {
 // Este método será chamado quando o Electron tiver finalizado
 // a inicialização e estiver pronto para criar janelas do navegador.
 app.whenReady().then(() => {
-  // Tratamento de permissões (microfone / câmera)
+  // Tratamento de permissões (microfone / câmera / áudio do sistema)
   try {
     const ses = session.defaultSession;
-    ses.setPermissionRequestHandler((wc, permission, callback) => {
-      if (permission === 'media') {
-        console.log('[Permissões] Aprovando acesso a mídia (microfone/câmera)');
+
+    // Handler para permissões de mídia
+    ses.setPermissionRequestHandler((webContents, permission, callback) => {
+      console.log(`[Permissões] Solicitação de permissão: ${permission}`);
+
+      if (permission === 'media' || permission === 'microphone' || permission === 'camera') {
+        console.log('[Permissões] ✅ Aprovando acesso a mídia');
         return callback(true);
       }
+
+      if (permission === 'desktopCapturer') {
+        console.log('[Permissões] ✅ Aprovando captura de desktop');
+        return callback(true);
+      }
+
+      console.log(`[Permissões] ❌ Negando permissão: ${permission}`);
       callback(false);
     });
 
-    // Política de segurança básica para evitar bloqueios de mixed content
+    // Permissões específicas para APIs de áudio/vídeo
+    ses.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
+      console.log(`[Permissões Check] ${permission} para ${requestingOrigin}`);
+      return permission === 'media' || permission === 'microphone' || permission === 'camera';
+    });
+
+    // MÉTODO EXATO DO NOTION: Display Media Request Handler com Loopback Audio
+    ses.setDisplayMediaRequestHandler((request, callback) => {
+      console.log('🎵 Display Media Request (método Notion) - Áudio:', request.audioRequested, 'Vídeo:', request.videoRequested);
+
+      // EXATAMENTE como Notion: fornece apenas áudio loopback (áudio do sistema)
+      if (request.audioRequested && !request.videoRequested) {
+        console.log('✅ Fornecendo áudio loopback (método Notion)');
+        callback({
+          audio: 'loopback'  // Chave para capturar áudio do sistema
+        });
+      } else if (request.audioRequested && request.videoRequested) {
+        // Se pedir vídeo também, dar apenas áudio (como Notion faz)
+        console.log('✅ Fornecendo apenas áudio loopback (ignorando vídeo, método Notion)');
+        callback({
+          audio: 'loopback'
+        });
+      } else {
+        console.log('❌ Requisição não suportada pelo método Notion');
+        callback({});
+      }
+    });
+
+    // Headers para permitir APIs modernas de mídia
     ses.webRequest.onHeadersReceived((details, callback) => {
       const headers = details.responseHeaders || {};
-      // Permitir uso interno (sem CSP estrito que possa bloquear APIs)
+
+      // Adicionar headers para suporte a APIs de mídia
+      headers['Permissions-Policy'] = ['microphone=*, camera=*, display-capture=*'];
+      headers['Feature-Policy'] = ['microphone *; camera *; display-capture *'];
+
       callback({ responseHeaders: headers });
     });
+
   } catch (e) {
-    console.warn('Falha ao configurar permission handler:', e);
+    console.warn('Falha ao configurar permission handlers:', e);
   }
 
   createWindow();
