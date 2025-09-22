@@ -123,8 +123,21 @@ export function useHistory() {
   // Marcar/desmarcar tarefa como concluída
   const toggleTask = (meetingId, taskIndex) => {
     const meeting = meetings.value.find(m => m.id === meetingId);
-    if (meeting && meeting.summary && meeting.summary.tarefas && meeting.summary.tarefas[taskIndex]) {
-      meeting.summary.tarefas[taskIndex].concluida = !meeting.summary.tarefas[taskIndex].concluida;
+
+    // Suporte para formato antigo (tarefas_e_acoes) e novo (action_items)
+    let tasks = null;
+    if (meeting && meeting.summary) {
+      if (meeting.summary.action_items) {
+        tasks = meeting.summary.action_items;
+      } else if (meeting.summary.tarefas_e_acoes) {
+        tasks = meeting.summary.tarefas_e_acoes;
+      } else if (meeting.summary.tarefas) {
+        tasks = meeting.summary.tarefas;
+      }
+    }
+
+    if (meeting && tasks && tasks[taskIndex]) {
+      tasks[taskIndex].concluida = !tasks[taskIndex].concluida;
       meeting.updatedAt = new Date().toISOString();
       saveMeetings();
 
@@ -136,6 +149,72 @@ export function useHistory() {
       return true;
     }
     return false;
+  };
+
+  // Regenerar resumo de uma reunião existente com novo formato estruturado
+  const regenerateMeetingSummary = async (meetingId, regenerateFunction) => {
+    const meeting = meetings.value.find(m => m.id === meetingId);
+    if (!meeting || !meeting.transcript) {
+      throw new Error('Reunião não encontrada ou sem transcrição disponível.');
+    }
+
+    try {
+      console.log('🔄 Regenerando resumo para reunião:', meeting.title);
+
+      // Usar a função de regeneração passada como parâmetro
+      const newSummary = await regenerateFunction(
+        meeting.transcript,
+        meeting.summary?.duracao_minutos || 0
+      );
+
+      // Preservar estado das tarefas se existirem no resumo anterior
+      if (meeting.summary && newSummary.action_items) {
+        // Tentar preservar status das tarefas com base na descrição
+        const oldTasks = meeting.summary.action_items || meeting.summary.tarefas_e_acoes || meeting.summary.tarefas || [];
+
+        newSummary.action_items.forEach((newTask, index) => {
+          // Buscar tarefa similar no resumo anterior
+          const similarTask = oldTasks.find(oldTask =>
+            oldTask.descricao && newTask.descricao &&
+            oldTask.descricao.toLowerCase().includes(newTask.descricao.toLowerCase().substring(0, 20)) ||
+            newTask.descricao.toLowerCase().includes(oldTask.descricao.toLowerCase().substring(0, 20))
+          );
+
+          if (similarTask) {
+            newSummary.action_items[index].concluida = similarTask.concluida;
+            console.log('✅ Preservado status da tarefa:', newTask.descricao.substring(0, 50));
+          }
+        });
+      }
+
+      // Atualizar a reunião
+      const updatedMeeting = {
+        ...meeting,
+        summary: newSummary,
+        updatedAt: new Date().toISOString()
+      };
+
+      // Atualizar no array de reuniões
+      const meetingIndex = meetings.value.findIndex(m => m.id === meetingId);
+      if (meetingIndex !== -1) {
+        meetings.value[meetingIndex] = updatedMeeting;
+        saveMeetings();
+
+        // Atualizar reunião selecionada se necessário
+        if (selectedMeeting.value && selectedMeeting.value.id === meetingId) {
+          selectedMeeting.value = { ...updatedMeeting };
+        }
+
+        console.log('✅ Resumo regenerado com sucesso!');
+        return updatedMeeting;
+      }
+
+      throw new Error('Erro ao atualizar reunião no histórico.');
+
+    } catch (error) {
+      console.error('❌ Erro ao regenerar resumo:', error);
+      throw error;
+    }
   };
 
   // Exportar reunião como JSON
@@ -206,8 +285,12 @@ export function useHistory() {
 
   const totalTasks = computed(() => {
     return meetings.value.reduce((total, meeting) => {
-      if (meeting.summary && meeting.summary.tarefas) {
-        return total + meeting.summary.tarefas.length;
+      if (meeting.summary) {
+        // Suporte para formato novo (action_items) e antigo (tarefas/tarefas_e_acoes)
+        const tasks = meeting.summary.action_items || meeting.summary.tarefas_e_acoes || meeting.summary.tarefas;
+        if (tasks && Array.isArray(tasks)) {
+          return total + tasks.length;
+        }
       }
       return total;
     }, 0);
@@ -215,8 +298,12 @@ export function useHistory() {
 
   const completedTasks = computed(() => {
     return meetings.value.reduce((total, meeting) => {
-      if (meeting.summary && meeting.summary.tarefas) {
-        return total + meeting.summary.tarefas.filter(task => task.concluida).length;
+      if (meeting.summary) {
+        // Suporte para formato novo (action_items) e antigo (tarefas/tarefas_e_acoes)
+        const tasks = meeting.summary.action_items || meeting.summary.tarefas_e_acoes || meeting.summary.tarefas;
+        if (tasks && Array.isArray(tasks)) {
+          return total + tasks.filter(task => task.concluida).length;
+        }
       }
       return total;
     }, 0);
@@ -244,6 +331,7 @@ export function useHistory() {
     clearSelection,
     updateMeeting,
     toggleTask,
+    regenerateMeetingSummary,
     exportMeeting,
     exportAllMeetings,
     loadMeetings,

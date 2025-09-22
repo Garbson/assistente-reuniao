@@ -492,7 +492,7 @@ export function useRecorder() {
       console.log(`📦 Dividido em ${chunks.length} chunks de 30s com overlap`);
 
       let fullTranscript = '';
-      const previousContext = ''; // Para manter contexto entre chunks
+      let previousContext = ''; // Para manter contexto entre chunks
 
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
@@ -820,35 +820,119 @@ export function useRecorder() {
       const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
       if (!apiKey) throw new Error('Chave da API ausente (.env).');
 
-      const prompt = `Você receberá a transcrição de uma reunião corporativa. Produza APENAS o JSON final (sem markdown, sem comentários) seguindo as regras abaixo rigorosamente.\n\nOBJETIVO: Gerar uma ATA DE REUNIÃO completa e detalhada com TODOS os pontos importantes discutidos.\n\nREGRAS:\n1. contexto: Breve contexto da reunião (1-2 frases sobre o propósito/tema principal).\n2. participantes: Array com TODOS os nomes mencionados na reunião. Se não houver nomes específicos, usar ["Participantes não identificados"].\n3. pontos_discutidos: TODOS os tópicos abordados na reunião, por ordem cronológica. Seja detalhado e completo. Cada item deve ser uma frase clara descrevendo o que foi discutido.\n4. decisoes_tomadas: Array com TODAS as decisões concretas tomadas durante a reunião. Se nenhuma decisão foi tomada, usar array vazio [].\n5. tarefas_e_acoes: TODAS as ações mencionadas, com responsável quando identificado. Formato: { "descricao": "ação específica", "responsavel": "nome ou 'A definir'", "prazo": "prazo mencionado ou 'Não definido'", "concluida": false }\n6. proximos_passos: Array com os próximos passos estratégicos mencionados.\n7. observacoes: Informações adicionais relevantes, dúvidas levantadas, ou pontos que ficaram pendentes.\n\nFORMATO EXATO DO RETORNO (JSON ÚNICO):\n{\n  "contexto": "...",\n  "participantes": ["..."],\n  "pontos_discutidos": ["..."],\n  "decisoes_tomadas": ["..."],\n  "tarefas_e_acoes": [{"descricao": "...", "responsavel": "...", "prazo": "...", "concluida": false}],\n  "proximos_passos": ["..."],\n  "observacoes": ["..."]\n}\n\nTranscrição da reunião:\n${transcript.value}\n\nRetorne somente o JSON completo e detalhado.`;
+      const prompt = `Você receberá a transcrição de uma reunião corporativa. Produza APENAS o JSON final (sem markdown, sem comentários) seguindo as regras abaixo rigorosamente.\n\nOBJETIVO: Gerar um RESUMO ESTRUTURADO com título inteligente e pontos principais organizados de forma direta e prática.\n\nREGRAS:\n1. titulo_reuniao: Crie um título descritivo e inteligente baseado no contexto da reunião (ex: "Mentoria de Desenvolvimento de Carreira", "Planejamento Sprint Q4", etc.)\n2. contexto_e_objetivo: Breve contexto da reunião e objetivo principal (1-2 frases).\n3. participantes: Array com TODOS os nomes mencionados na reunião. Se não houver nomes específicos, usar ["Participantes não identificados"].\n4. pontos_principais: Array de objetos com os tópicos específicos discutidos. QUEBRE EM SUBTÓPICOS MENORES E ESPECÍFICOS. Cada objeto deve ter:\n   - "subtitulo": nome/título específico do subtópico (ex: "Melhorar tela de login", "Código único de oferta", "Problema com autenticação", "Configurar servidor de desenvolvimento")\n   - "pontos_abordados": array com 2-4 pontos específicos do que foi falado sobre esse subtópico (ex: ["jesiel falou para mudar as cores do fundo", "ajustar as bordas para ficar mais arredondadas"])\n5. action_items: TODAS as ações mencionadas. Formato: { "descricao": "ação específica", "responsavel": "nome ou 'A definir'", "prazo": "prazo mencionado ou 'Não definido'", "concluida": false }\n6. decisoes_tomadas: Array com decisões concretas tomadas durante a reunião.\n7. proximos_passos: Próximas etapas estratégicas mencionadas.\n\nIMPORTANTE: Para os pontos_principais, QUEBRE EM MUITOS SUBTÓPICOS ESPECÍFICOS ao invés de poucos tópicos grandes. Cada subtópico deve ter entre 2-4 pontos abordados. Seja específico e direto. Capture exatamente o que foi dito, incluindo quem falou o quê. Use linguagem natural e direta.\n\nEXEMPLO CORRETO de pontos_principais (muitos subtópicos específicos):\n[\n  {\n    "subtitulo": "Cores da tela de login",\n    "pontos_abordados": [\n      "jesiel falou para mudar as cores do fundo",\n      "usar tons mais escuros"\n    ]\n  },\n  {\n    "subtitulo": "Bordas dos elementos",\n    "pontos_abordados": [\n      "ajustar as bordas para ficar mais arredondadas",\n      "aplicar border-radius de 8px"\n    ]\n  },\n  {\n    "subtitulo": "Tipografia dos botões",\n    "pontos_abordados": [\n      "revisar tipografia dos botões",\n      "usar fonte maior para melhor legibilidade"\n    ]\n  },\n  {\n    "subtitulo": "Localização do código único",\n    "pontos_abordados": [\n      "está presente no book",\n      "seguindo a documentação o código único já vem do book porém precisa achar ele"\n    ]\n  },\n  {\n    "subtitulo": "Verificação com backend",\n    "pontos_abordados": [\n      "verificar com o time de backend onde está localizado",\n      "agendar reunião para entender a estrutura"\n    ]\n  }\n]\n\nNÃO FAÇA subtópicos muito grandes com muitos pontos. PREFIRA vários subtópicos específicos e menores.\n\nFORMATO EXATO DO RETORNO (JSON ÚNICO):\n{\n  "titulo_reuniao": "...",\n  "contexto_e_objetivo": "...",\n  "participantes": ["..."],\n  "pontos_principais": [\n    {\n      "subtitulo": "...",\n      "pontos_abordados": ["...", "...", "..."]\n    }\n  ],\n  "action_items": [{"descricao": "...", "responsavel": "...", "prazo": "...", "concluida": false}],\n  "decisoes_tomadas": ["..."],\n  "proximos_passos": ["..."],\n  "formato_estruturado": true\n}\n\nTranscrição da reunião:\n${transcript.value}\n\nRetorne somente o JSON completo e detalhado no formato estruturado.`;
 
       const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.6, maxOutputTokens: 4000 }
+          generationConfig: { temperature: 0.6, maxOutputTokens: 8000 }
         })
       });
       if (!resp.ok) throw new Error('Erro da API: ' + await resp.text());
       const data = await resp.json();
       const raw = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('\n') || '';
+      console.log('🔍 Resposta bruta da IA (nova gravação):', raw);
+
       const match = raw.match(/\{[\s\S]*\}/);
       if (!match) throw new Error('JSON não encontrado na resposta da IA.');
       const parsed = JSON.parse(match[0]);
+      console.log('📋 JSON parsed (nova gravação):', parsed);
 
-      return {
-        contexto: parsed.contexto || '',
+      // Suporte para formato estruturado (novo) e formato antigo (compatibilidade)
+      if (parsed.formato_estruturado) {
+        return {
+          titulo_reuniao: parsed.titulo_reuniao || 'Reunião',
+          contexto_e_objetivo: parsed.contexto_e_objetivo || '',
+          participantes: parsed.participantes || ['Participantes não identificados'],
+          pontos_principais: parsed.pontos_principais || [],
+          action_items: parsed.action_items || [],
+          decisoes_tomadas: parsed.decisoes_tomadas || [],
+          proximos_passos: parsed.proximos_passos || [],
+          data_reuniao: new Date().toISOString(),
+          duracao_minutos: Math.round(getRecordingDuration() / 60 * 10) / 10,
+          fonte: 'Transcrição via Whisper + Análise via Gemini',
+          formato_estruturado: true
+        };
+      } else {
+        // Formato antigo (compatibilidade)
+        return {
+          contexto: parsed.contexto || '',
+          participantes: parsed.participantes || ['Participantes não identificados'],
+          pontos_discutidos: parsed.pontos_discutidos || [],
+          decisoes_tomadas: parsed.decisoes_tomadas || [],
+          tarefas_e_acoes: parsed.tarefas_e_acoes || [],
+          proximos_passos: parsed.proximos_passos || [],
+          observacoes: parsed.observacoes || [],
+          data_reuniao: new Date().toISOString(),
+          duracao_minutos: Math.round(getRecordingDuration() / 60 * 10) / 10,
+          fonte: 'Transcrição via Whisper + Análise via Gemini'
+        };
+      }
+    } catch (e) {
+      error.value = e.message;
+      throw e;
+    } finally {
+      isProcessing.value = false;
+    }
+  };
+
+  // Nova função para regenerar resumo de reuniões existentes no formato estruturado
+  const regenerateSummaryWithNewFormat = async (transcriptText, originalDuration = 0) => {
+    if (!transcriptText) throw new Error('Nenhuma transcrição fornecida.');
+    isProcessing.value = true;
+    error.value = null;
+
+    try {
+      const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
+      if (!apiKey) throw new Error('Chave da API ausente (.env).');
+
+      const prompt = `Você receberá a transcrição de uma reunião corporativa. Produza APENAS o JSON final (sem markdown, sem comentários) seguindo as regras abaixo rigorosamente.\n\nOBJETIVO: Gerar um RESUMO ESTRUTURADO com título inteligente e pontos principais organizados de forma direta e prática.\n\nREGRAS:\n1. titulo_reuniao: Crie um título descritivo e inteligente baseado no contexto da reunião (ex: "Mentoria de Desenvolvimento de Carreira", "Planejamento Sprint Q4", etc.)\n2. contexto_e_objetivo: Breve contexto da reunião e objetivo principal (1-2 frases).\n3. participantes: Array com TODOS os nomes mencionados na reunião. Se não houver nomes específicos, usar ["Participantes não identificados"].\n4. pontos_principais: Array de objetos com os tópicos específicos discutidos. QUEBRE EM SUBTÓPICOS MENORES E ESPECÍFICOS. Cada objeto deve ter:\n   - "subtitulo": nome/título específico do subtópico (ex: "Melhorar tela de login", "Código único de oferta", "Problema com autenticação", "Configurar servidor de desenvolvimento")\n   - "pontos_abordados": array com 2-4 pontos específicos do que foi falado sobre esse subtópico (ex: ["jesiel falou para mudar as cores do fundo", "ajustar as bordas para ficar mais arredondadas"])\n5. action_items: TODAS as ações mencionadas. Formato: { "descricao": "ação específica", "responsavel": "nome ou 'A definir'", "prazo": "prazo mencionado ou 'Não definido'", "concluida": false }\n6. decisoes_tomadas: Array com decisões concretas tomadas durante a reunião.\n7. proximos_passos: Próximas etapas estratégicas mencionadas.\n\nIMPORTANTE: Para os pontos_principais, QUEBRE EM MUITOS SUBTÓPICOS ESPECÍFICOS ao invés de poucos tópicos grandes. Cada subtópico deve ter entre 2-4 pontos abordados. Seja específico e direto. Capture exatamente o que foi dito, incluindo quem falou o quê. Use linguagem natural e direta.\n\nEXEMPLO CORRETO de pontos_principais (muitos subtópicos específicos):\n[\n  {\n    "subtitulo": "Cores da tela de login",\n    "pontos_abordados": [\n      "jesiel falou para mudar as cores do fundo",\n      "usar tons mais escuros"\n    ]\n  },\n  {\n    "subtitulo": "Bordas dos elementos",\n    "pontos_abordados": [\n      "ajustar as bordas para ficar mais arredondadas",\n      "aplicar border-radius de 8px"\n    ]\n  },\n  {\n    "subtitulo": "Tipografia dos botões",\n    "pontos_abordados": [\n      "revisar tipografia dos botões",\n      "usar fonte maior para melhor legibilidade"\n    ]\n  },\n  {\n    "subtitulo": "Localização do código único",\n    "pontos_abordados": [\n      "está presente no book",\n      "seguindo a documentação o código único já vem do book porém precisa achar ele"\n    ]\n  },\n  {\n    "subtitulo": "Verificação com backend",\n    "pontos_abordados": [\n      "verificar com o time de backend onde está localizado",\n      "agendar reunião para entender a estrutura"\n    ]\n  }\n]\n\nNÃO FAÇA subtópicos muito grandes com muitos pontos. PREFIRA vários subtópicos específicos e menores.\n\nFORMATO EXATO DO RETORNO (JSON ÚNICO):\n{\n  "titulo_reuniao": "...",\n  "contexto_e_objetivo": "...",\n  "participantes": ["..."],\n  "pontos_principais": [\n    {\n      "subtitulo": "...",\n      "pontos_abordados": ["...", "...", "..."]\n    }\n  ],\n  "action_items": [{"descricao": "...", "responsavel": "...", "prazo": "...", "concluida": false}],\n  "decisoes_tomadas": ["..."],\n  "proximos_passos": ["..."],\n  "formato_estruturado": true\n}\n\nTranscrição da reunião:\n${transcriptText}\n\nRetorne somente o JSON completo e detalhado no formato estruturado.`;
+
+      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.6, maxOutputTokens: 8000 }
+        })
+      });
+
+      if (!resp.ok) throw new Error('Erro da API: ' + await resp.text());
+
+      const data = await resp.json();
+      const raw = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('\n') || '';
+      console.log('🔍 Resposta bruta da IA (regeneração):', raw);
+
+      const match = raw.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error('JSON não encontrado na resposta da IA.');
+      const parsed = JSON.parse(match[0]);
+      console.log('📋 JSON parsed (regeneração):', parsed);
+
+      const result = {
+        titulo_reuniao: parsed.titulo_reuniao || 'Reunião',
+        contexto_e_objetivo: parsed.contexto_e_objetivo || '',
         participantes: parsed.participantes || ['Participantes não identificados'],
-        pontos_discutidos: parsed.pontos_discutidos || [],
+        pontos_principais: parsed.pontos_principais || [],
+        action_items: parsed.action_items || [],
         decisoes_tomadas: parsed.decisoes_tomadas || [],
-        tarefas_e_acoes: parsed.tarefas_e_acoes || [],
         proximos_passos: parsed.proximos_passos || [],
-        observacoes: parsed.observacoes || [],
         data_reuniao: new Date().toISOString(),
-        duracao_minutos: Math.round(getRecordingDuration() / 60 * 10) / 10,
-        fonte: 'Transcrição via Whisper + Análise via Gemini'
+        duracao_minutos: originalDuration,
+        fonte: 'Regeneração: Transcrição via Whisper + Análise via Gemini',
+        formato_estruturado: true,
+        // Limpar campos do formato antigo para evitar conflitos
+        pontos_discutidos: undefined,
+        tarefas: undefined,
+        tarefas_e_acoes: undefined,
+        geral: undefined,
+        observacoes: undefined
       };
+
+      console.log('✅ Resultado final da regeneração:', result);
+      return result;
+
     } catch (e) {
       error.value = e.message;
       throw e;
@@ -961,6 +1045,7 @@ export function useRecorder() {
     clearTranscript,
     transcribeAudio,
     generateSummaryFromTranscript,
+    regenerateSummaryWithNewFormat,
     getRecordingDuration,
     transcribeAudioInChunks,
     setOpenAIApiKey,
