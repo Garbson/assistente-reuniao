@@ -68,11 +68,10 @@ import SummaryView from "./components/SummaryView.vue";
 import { useHistory } from "./composables/useHistory.js";
 
 // Composables
-const { deleteMeeting, selectMeeting, clearSelection } = useHistory();
+const { deleteMeeting, selectMeeting, clearSelection, selectedMeeting } = useHistory();
 
 // Estado da aplicação
 const currentView = ref("recorder"); // 'recorder', 'summary'
-const selectedMeeting = ref(null);
 const isLoading = ref(false);
 const loadingMessage = ref("");
 
@@ -80,18 +79,15 @@ const loadingMessage = ref("");
 // Métodos de navegação
 const handleNewMeeting = () => {
   currentView.value = "recorder";
-  selectedMeeting.value = null;
   clearSelection();
 };
 
 const handleMeetingSelected = (meeting) => {
-  selectedMeeting.value = meeting;
   selectMeeting(meeting);
   currentView.value = "summary";
 };
 
 const handleSummaryGenerated = (meeting) => {
-  selectedMeeting.value = meeting;
   selectMeeting(meeting);
   currentView.value = "summary";
 };

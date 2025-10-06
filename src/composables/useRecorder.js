@@ -1,5 +1,7 @@
 import { onMounted, onUnmounted, ref } from 'vue';
+import { OpenAIChat } from '../utils/openaiChat.js';
 import { OpenAITranscription } from '../utils/openaiTranscription.js';
+import { useCache } from './useCache.js';
 
 // Composable OTIMIZADO: grava áudio do sistema + microfone e usa OpenAI Whisper + Gemini para transcrever e resumir
 export function useRecorder() {
@@ -20,6 +22,19 @@ export function useRecorder() {
     chunkDetails: [],
     estimatedTimeRemaining: 0,
     startTime: null
+  });
+
+  // Estados para transcrição em tempo real
+  const realTimeTranscription = ref({
+    enabled: true,
+    chunks: [],
+    activeChunks: new Map(),
+    processedChunks: new Map(),
+    sessionId: null,
+    partialTranscript: '',
+    isProcessing: false,
+    processingQueue: [],
+    maxParallelChunks: 6
   });
 
   // Estado da captura de áudio
@@ -44,8 +59,366 @@ export function useRecorder() {
   let OPENAI_ORG_ID = localStorage.getItem('openai_org_id') || null;
 
   let openaiTranscription = null;
+  let openaiChat = null;
   let audioAnalyzer = null;
   let analysisInterval = null;
+
+  // Sistema de cache
+  const cache = useCache();
+  let chunkingInterval = null;
+  let currentChunkIndex = 0;
+  // Estruturas globais de n-grams vistos durante esta sessão de transcrição
+  const seenNgrams = new Set(); // armazena hashes de n-grams (3-8 tokens)
+
+  const hashString = (s) => {
+    let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 131 + s.charCodeAt(i)) >>> 0; } return h.toString(36);
+  };
+
+  const tokenize = (text) => text
+    .toLowerCase()
+    .replace(/["“”‘’.,!?;:/()\[\]]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean);
+
+  const registerNgrams = (tokens, min = 3, max = 8) => {
+    for (let n = min; n <= max; n++) {
+      for (let i = 0; i + n <= tokens.length; i++) {
+        const slice = tokens.slice(i, i + n).join(' ');
+        if (slice.length < 12) continue; // ignora pedaços muito curtos
+        seenNgrams.add(hashString(slice));
+      }
+    }
+  };
+
+  const repetitionCoverage = (tokens, min = 3, max = 8) => {
+    let total = 0, repeated = 0;
+    for (let n = min; n <= max; n++) {
+      for (let i = 0; i + n <= tokens.length; i++) {
+        const slice = tokens.slice(i, i + n).join(' ');
+        if (slice.length < 12) continue;
+        total++;
+        if (seenNgrams.has(hashString(slice))) repeated++;
+      }
+    }
+    if (total === 0) return 0;
+    return repeated / total;
+  };
+
+  // ==================== UTILITÁRIOS DE DEDUPLICAÇÃO ====================
+  // Remove repetições consecutivas de frases/linhas causadas por overlap ou alucinação
+  const normalizeWhitespace = (text) => text
+    .replace(/[\u00A0\t]+/g, ' ')
+    .replace(/ +/g, ' ')
+    .replace(/\s+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  const splitIntoSentences = (text) => {
+    // Divide por pontuação forte mantendo conteúdo limpo
+    return text
+      .split(/(?<=[.!?…])\s+/u)
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+  };
+
+  const dedupeSequentialSentences = (sentences) => {
+    const result = [];
+    let last = '';
+    for (const s of sentences) {
+      const norm = s.toLowerCase();
+      if (norm === last) continue; // igual exato
+      // similaridade simples (reduz repetições ligeiras)
+      if (last && norm.length > 12) {
+        const shorter = norm.length < last.length ? norm : last;
+        const longer = norm.length < last.length ? last : norm;
+        if (longer.includes(shorter) && shorter.length / longer.length > 0.85) continue;
+      }
+      result.push(s);
+      last = norm;
+    }
+    return result;
+  };
+
+  // Sistema AGRESSIVO de detecção e remoção de duplicações
+  const aggressiveDeduplication = (text) => {
+    if (!text || text.length < 50) return text;
+
+    let result = text;
+
+    // 1. Remove repetições de frases EXATAS (case-insensitive)
+    const sentences = result.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 0);
+    const seenExact = new Set();
+    const filteredExact = [];
+
+    sentences.forEach(sentence => {
+      const normalized = sentence.trim().toLowerCase()
+        .replace(/["""''.,!?;:]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (normalized.length >= 8) {
+        if (seenExact.has(normalized)) {
+          if (window.DEBUG_DEDUP) {
+            console.log('[DEDUP-EXACT] Removendo frase duplicada:', sentence.substring(0, 80));
+          }
+          return; // Pula esta frase
+        }
+        seenExact.add(normalized);
+      }
+      filteredExact.push(sentence);
+    });
+
+    result = filteredExact.join(' ');
+
+    // 2. Remove repetições de fragmentos longos (50+ chars)
+    const fragments = result.match(/.{50,150}/g) || [];
+    const seenFragments = new Set();
+
+    fragments.forEach(fragment => {
+      const normalized = fragment.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+      if (seenFragments.has(normalized)) {
+        // Se encontrar este fragmento novamente, remove do resultado
+        const regex = new RegExp(fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+        const matches = (result.match(regex) || []).length;
+        if (matches > 1) {
+          result = result.replace(regex, ''); // Remove TODAS as ocorrências adicionais
+          if (window.DEBUG_DEDUP) {
+            console.log('[DEDUP-FRAGMENT] Removendo fragmento repetido:', fragment.substring(0, 60));
+          }
+        }
+      }
+      seenFragments.add(normalized);
+    });
+
+    return result.replace(/\s+/g, ' ').trim();
+  };
+
+  // Colapsa frases/fragments repetidos em todo o texto (não só consecutivos)
+  const collapseHighFrequencyPhrases = (text, { minLength = 15, maxLength = 120, maxOccurrences = 2 } = {}) => {
+    const sentenceSplit = text
+      .replace(/\"/g, '"')
+      .split(/(?<=[.!?])\s+/);
+    const freq = new Map();
+    const normalized = sentenceSplit.map(raw => {
+      const s = raw.trim();
+      const base = s
+        .toLowerCase()
+        .replace(/"/g, '')
+        .replace(/\s+/g, ' ')
+        .replace(/[“”]/g, '')
+        .replace(/[:;,]$/, '')
+        .trim();
+      if (base.length >= minLength && base.length <= maxLength) {
+        freq.set(base, (freq.get(base) || 0) + 1);
+      }
+      return { raw: s, base };
+    });
+
+    const collapsed = [];
+    const keptCount = new Map();
+    for (const item of normalized) {
+      const count = freq.get(item.base) || 0;
+      if (count > maxOccurrences) {
+        const used = keptCount.get(item.base) || 0;
+        if (used >= maxOccurrences) {
+          if (window.DEBUG_DEDUP) console.log('[DEDUP] Removendo repetição global:', item.raw);
+          continue;
+        }
+        keptCount.set(item.base, used + 1);
+        collapsed.push(item.raw);
+      } else {
+        collapsed.push(item.raw);
+      }
+    }
+    return collapsed.join(' ');
+  };
+
+  const collapseShortEchoes = (text) => {
+    // Remove eco de 2-6 palavras repetidas 3+ vezes seguidas
+    let out = text.replace(/\b(\w+(?:\s+\w+){1,5})\b(?:\s+\1\b){2,}/gi, '$1');
+    // Colapsa repetições de uma mesma palavra (ex: 'minutos') 5+ vezes
+    out = out.replace(/\b(\w{3,})\b(?:\s+\1\b){4,}/gi, '$1');
+    // Reduz sequências numéricas repetidas (ex: '10 minutos' em loop)
+    out = out.replace(/(\b\d+\s+\w{3,}\b)(?:\s+\1){3,}/gi, '$1');
+    return out;
+  };
+
+  const cleanChunkRepetitions = (raw) => {
+    if (!raw) return raw;
+    let t = normalizeWhitespace(raw);
+
+    // PRIMEIRO: Aplica deduplicação agressiva
+    t = aggressiveDeduplication(t);
+
+    t = collapseShortEchoes(t);
+    // Remoção de loops longos onde um bloco médio (8-20 palavras) repete 3+ vezes
+    t = t.replace(/((?:\b\w+\b\s+){8,20})\1{2,}/gi, '$1');
+    t = collapseHighFrequencyPhrases(t, { maxOccurrences: 1 });
+    const sentences = splitIntoSentences(t);
+    const deduped = dedupeSequentialSentences(sentences);
+    return deduped.join(' ');
+  };
+
+  const mergeAndClean = (currentFull, newPart) => {
+    // PRIMEIRO: Aplica deduplicação agressiva no novo chunk
+    const cleanedPart = aggressiveDeduplication(cleanChunkRepetitions(newPart));
+    if (!currentFull) return cleanedPart;
+
+    // Verifica se a nova parte é uma repetição quase completa da anterior
+    const fullTokens = tokenize(currentFull);
+    const partTokens = tokenize(cleanedPart);
+    const coverage = repetitionCoverage(partTokens);
+
+    if (coverage > 0.50) { // 50% ou mais já visto => muito repetitivo
+      if (window.DEBUG_DEDUP) console.log('[DEDUP] Rejeitando chunk com alta cobertura', (coverage * 100).toFixed(1) + '%');
+      return currentFull; // Mantém apenas o que já tinha
+    }
+
+    // Evita repetição onde o final do full já contém o início do novo
+    const tail = currentFull.split(/\s+/).slice(-30).join(' ').toLowerCase();
+    let part = cleanedPart;
+    for (let window = 15; window >= 5; window--) {
+      const words = cleanedPart.split(/\s+/);
+      if (words.length < window) break;
+      const startSeq = words.slice(0, window).join(' ').toLowerCase();
+      if (tail.includes(startSeq)) {
+        part = words.slice(window).join(' ');
+        if (window.DEBUG_DEDUP) console.log('[DEDUP] Removendo overlap de', window, 'palavras');
+        break;
+      }
+    }
+
+    // Registra n-grams do novo texto final
+    const combined = normalizeWhitespace(currentFull + (part.trim() ? ' ' + part : ''));
+    registerNgrams(partTokens);
+
+    // Aplica deduplicação final no resultado combinado
+    return aggressiveDeduplication(combined);
+  };
+
+  const finalizeTranscriptCleaning = (text) => {
+    if (!text) return text;
+
+    // PRIMEIRO: Deduplicação agressiva em todo o transcript
+    let t = aggressiveDeduplication(text);
+
+    t = normalizeWhitespace(t);
+    t = collapseShortEchoes(t);
+    // Loop blocks (parágrafos médios) repetidos
+    t = t.replace(/((?:\b\w+\b[ .,;!?\-]{1,3}){15,60})\1{1,}/gi, '$1');
+    // Sequências tipo '10 minutos' extensivamente repetidas
+    t = t.replace(/(\b\d+\s+minutos?\b)(?:\s+\1){2,}/gi, '$1');
+    // Sequências de mesma frase curta repetidas >3x
+    t = t.replace(/(\b[^.!?]{10,80}[.!?])(\s+\1){2,}/g, '$1');
+    // Colapsa frases médias repetidas globalmente (mantém apenas 1)
+    t = collapseHighFrequencyPhrases(t, { maxOccurrences: 1 });
+    // Segunda passada baseada em n-gram global: remove frases cujo conjunto de n-grams já é >80% repetido
+    const sentences = t.split(/(?<=[.!?])\s+/);
+    const filtered = [];
+    for (const s of sentences) {
+      const tokens = tokenize(s);
+      if (tokens.length === 0) continue;
+      const cov = repetitionCoverage(tokens);
+      if (cov > 0.60 && tokens.length > 6) {
+        if (window.DEBUG_DEDUP) console.log('[DEDUP] Removendo frase alta cobertura final', (cov * 100).toFixed(1) + '%', '=>', s.slice(0, 120));
+        continue;
+      }
+      // Registrar ngrams desta sentença (para próximos)
+      registerNgrams(tokens);
+      filtered.push(s);
+    }
+    t = filtered.join(' ');
+    // Remove duplicações de parágrafos inteiros consecutivos
+    const paragraphs = t.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+    const cleanedParas = [];
+    let prev = '';
+    for (const p of paragraphs) {
+      const norm = p.toLowerCase();
+      if (norm === prev) continue;
+      cleanedParas.push(p);
+      prev = norm;
+    }
+    return cleanedParas.join('\n\n');
+  };
+
+  // ======================================================================
+  // SISTEMA CONSOLIDADO DE DEDUPLICAÇÃO (Nova implementação otimizada)
+  // ======================================================================
+
+  const efficientDeduplication = (text) => {
+    if (!text || text.length < 10) return text;
+
+    let result = text.trim();
+
+    // 1. Normalização básica
+    result = result.replace(/\s+/g, ' ');
+
+    // 2. Remove repetições imediatas de palavras/frases
+    result = result.replace(/(\b[\w\s]{2,15}\b)(\s+\1){2,}/gi, '$1');
+
+    // 3. Remove repetições de frases curtas consecutivas
+    result = result.replace(/(\b[^.!?]{5,40}[.!?])(\s+\1){1,}/gi, '$1');
+
+    // 4. Remove loops de conversas curtas (ex: "Oi José. Beleza. Sim.")
+    result = result.replace(/(\b[\w\s,!?]{5,25}\.\s*)(\1){2,}/gi, '$1');
+
+    // 5. Remove repetições de sequências longas (parágrafos)
+    result = result.replace(/([\w\s,.!?]{30,100})(\s+\1){1,}/gi, '$1');
+
+    return result.trim();
+  };
+
+  const smartChunkCleaning = (chunkText) => {
+    if (!chunkText) return chunkText;
+
+    // Aplicar deduplicação eficiente
+    let cleaned = efficientDeduplication(chunkText);
+
+    // Remove frases muito curtas e repetitivas (menos de 3 palavras)
+    const sentences = cleaned.split(/[.!?]+/).filter(s => s.trim().length > 0);
+    const validSentences = sentences.filter(sentence => {
+      const words = sentence.trim().split(/\s+/);
+      return words.length >= 3; // Mínimo 3 palavras por sentença
+    });
+
+    return validSentences.join('. ').trim();
+  };
+
+  // ======================================================================
+  // SISTEMA DE LOGS DETALHADOS PARA TRACKING DE CHUNKS
+  // ======================================================================
+
+  const logChunkStats = () => {
+    const stats = {
+      total: realTimeTranscription.value.processedChunks.size,
+      active: realTimeTranscription.value.activeChunks.size,
+      queued: realTimeTranscription.value.processingQueue.length,
+      successful: 0,
+      failed: 0,
+      timestamp: new Date().toISOString()
+    };
+
+    // Contar sucessos e falhas
+    Array.from(realTimeTranscription.value.processedChunks.values()).forEach(chunk => {
+      if (chunk.error) {
+        stats.failed++;
+      } else {
+        stats.successful++;
+      }
+    });
+
+    console.log(`📊 [CHUNK STATS] Total: ${stats.total} | Sucesso: ${stats.successful} | Erro: ${stats.failed} | Ativos: ${stats.active} | Fila: ${stats.queued}`);
+    return stats;
+  };
+
+  const logDetailedChunkInfo = (chunkIndex, action, details = {}) => {
+    const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
+    console.log(`🔍 [${timestamp}] Chunk ${chunkIndex + 1} - ${action}:`, details);
+  };
+
+  // ======================================================================
 
   const checkSupport = () => {
     isSupported.value = !!(navigator.mediaDevices && window.MediaRecorder);
@@ -288,6 +661,254 @@ export function useRecorder() {
     }
   };
 
+  // Função para iniciar chunking automático em tempo real
+  const startRealTimeChunking = () => {
+    if (!realTimeTranscription.value.enabled || !OPENAI_API_KEY) {
+      console.log('🔄 Transcrição em tempo real desabilitada');
+      return;
+    }
+
+    // Gera ID único para esta sessão
+    realTimeTranscription.value.sessionId = `session_${Date.now()}_${Math.random().toString(36)}`;
+    realTimeTranscription.value.partialTranscript = '';
+    realTimeTranscription.value.chunks = [];
+    realTimeTranscription.value.activeChunks.clear();
+    realTimeTranscription.value.processedChunks.clear();
+    currentChunkIndex = 0;
+
+    console.log('🚀 Chunking automático iniciado - sessão:', realTimeTranscription.value.sessionId);
+
+    // Processa chunks a cada 15 segundos
+    chunkingInterval = setInterval(async () => {
+      try {
+        await processCurrentChunk();
+      } catch (e) {
+        console.error('❌ Erro no chunking automático:', e);
+      }
+    }, 15000); // 15 segundos
+  };
+
+  // Função para processar chunk atual durante gravação
+  const processCurrentChunk = async () => {
+    if (!isRecording.value || audioChunks.length === 0) return;
+
+    try {
+      // Pega os chunks acumulados até agora
+      const currentChunks = [...audioChunks];
+      const chunkBlob = new Blob(currentChunks, { type: mediaRecorder.mimeType });
+
+      if (chunkBlob.size < 50000) { // Menor que 50KB, muito pequeno
+        console.log('⏭️ Chunk muito pequeno, aguardando mais dados...');
+        return;
+      }
+
+      const chunkIndex = currentChunkIndex++;
+      const startTime = chunkIndex * 15; // Estimativa baseada no intervalo
+      const endTime = startTime + 15;
+
+      console.log(`📦 Processando chunk ${chunkIndex + 1} em tempo real (${(chunkBlob.size / 1024).toFixed(1)}KB)`);
+      logDetailedChunkInfo(chunkIndex, 'INICIADO', { size: `${(chunkBlob.size / 1024).toFixed(1)}KB`, startTime, endTime });
+
+      // Verificar cache primeiro
+      const cached = await cache.getCachedChunk(chunkBlob, startTime, endTime);
+      if (cached) {
+        realTimeTranscription.value.processedChunks.set(chunkIndex, {
+          text: cached.transcription,
+          fromCache: true,
+          chunkIndex,
+          startTime,
+          endTime
+        });
+        updatePartialTranscript();
+        return;
+      }
+
+      // Adicionar à queue de processamento (com retry)
+      realTimeTranscription.value.processingQueue.push({
+        chunkIndex,
+        blob: chunkBlob,
+        startTime,
+        endTime,
+        timestamp: Date.now(),
+        retryCount: 0
+      });
+
+      processChunkQueue();
+
+    } catch (e) {
+      console.error('❌ Erro ao processar chunk atual:', e);
+    }
+  };
+
+  // Função para processar queue de chunks em paralelo
+  const processChunkQueue = async () => {
+    if (realTimeTranscription.value.isProcessing) return;
+
+    realTimeTranscription.value.isProcessing = true;
+
+    try {
+      const maxParallel = realTimeTranscription.value.maxParallelChunks;
+      const activeCount = realTimeTranscription.value.activeChunks.size;
+
+      // Processa chunks pendentes até o limite paralelo
+      while (
+        realTimeTranscription.value.processingQueue.length > 0 &&
+        realTimeTranscription.value.activeChunks.size < maxParallel
+      ) {
+        const chunkData = realTimeTranscription.value.processingQueue.shift();
+        processChunkAsync(chunkData);
+      }
+
+    } finally {
+      realTimeTranscription.value.isProcessing = false;
+    }
+  };
+
+  // Função para processar chunk individual de forma assíncrona (com retry)
+  const processChunkAsync = async (chunkData) => {
+    const { chunkIndex, blob, startTime, endTime, retryCount = 0 } = chunkData;
+
+    // Marca como ativo
+    realTimeTranscription.value.activeChunks.set(chunkIndex, {
+      startTime: Date.now(),
+      status: 'transcribing'
+    });
+
+    try {
+      // Inicializa OpenAI se necessário
+      if (!openaiTranscription) {
+        openaiTranscription = new OpenAITranscription();
+        await openaiTranscription.initialize(OPENAI_API_KEY, OPENAI_ORG_ID);
+      }
+
+      // Transcreve com Whisper (contexto mínimo para evitar repetições)
+      const transcriptionResult = await openaiTranscription.transcribe(blob, {
+        model: 'whisper-1',
+        language: 'pt',
+        temperature: 0.0,
+        prompt: 'Transcrição de reunião corporativa em português brasileiro. Evite repetições.'
+      });
+
+      let transcriptionText = typeof transcriptionResult === 'string'
+        ? transcriptionResult
+        : transcriptionResult.text;
+      transcriptionText = smartChunkCleaning(transcriptionText);
+
+      // Salva no cache
+      await cache.cacheChunk(blob, startTime, endTime, transcriptionText, {
+        model: 'whisper-1',
+        sessionId: realTimeTranscription.value.sessionId
+      });
+
+      // Armazena resultado
+      realTimeTranscription.value.processedChunks.set(chunkIndex, {
+        text: transcriptionText,
+        fromCache: false,
+        chunkIndex,
+        startTime,
+        endTime,
+        processedAt: Date.now()
+      });
+
+      console.log(`✅ Chunk ${chunkIndex + 1} transcrito: "${transcriptionText.substring(0, 100)}..."`);
+      logDetailedChunkInfo(chunkIndex, 'SUCESSO', {
+        textLength: transcriptionText.length,
+        retryCount,
+        preview: transcriptionText.substring(0, 50) + '...'
+      });
+
+      // Atualiza transcrição parcial
+      updatePartialTranscript();
+
+      // Log estatísticas a cada 5 chunks
+      if ((chunkIndex + 1) % 5 === 0) {
+        logChunkStats();
+      }
+
+    } catch (e) {
+      console.error(`❌ Erro ao transcrever chunk ${chunkIndex + 1} (tentativa ${retryCount + 1}):`, e);
+
+      // Implementa retry automático (máximo 3 tentativas)
+      if (retryCount < 2) {
+        console.log(`🔄 Reagendando chunk ${chunkIndex + 1} para retry...`);
+
+        // Reagenda o chunk com retry incrementado
+        realTimeTranscription.value.processingQueue.push({
+          chunkIndex,
+          blob,
+          startTime,
+          endTime,
+          timestamp: Date.now(),
+          retryCount: retryCount + 1
+        });
+      } else {
+        // Após 3 tentativas, armazena erro final
+        console.error(`💀 Chunk ${chunkIndex + 1} falhou após 3 tentativas`);
+        realTimeTranscription.value.processedChunks.set(chunkIndex, {
+          text: `[Chunk ${chunkIndex + 1} falhou após 3 tentativas: ${e.message}]`,
+          error: true,
+          chunkIndex,
+          startTime,
+          endTime,
+          retryCount
+        });
+      }
+    } finally {
+      // Remove da lista de ativos
+      realTimeTranscription.value.activeChunks.delete(chunkIndex);
+
+      // Continua processando queue
+      setTimeout(() => processChunkQueue(), 500);
+    }
+  };
+
+  // Função para atualizar transcrição parcial
+  const updatePartialTranscript = () => {
+    try {
+      const sortedChunks = Array.from(realTimeTranscription.value.processedChunks.values())
+        .sort((a, b) => a.chunkIndex - b.chunkIndex);
+
+      const transcriptParts = sortedChunks.map(chunk => smartChunkCleaning(chunk.text)).filter(text => text.trim());
+      let newPartialTranscript = transcriptParts.join(' ').trim();
+      newPartialTranscript = efficientDeduplication(newPartialTranscript);
+
+      if (newPartialTranscript !== realTimeTranscription.value.partialTranscript) {
+        realTimeTranscription.value.partialTranscript = newPartialTranscript;
+        transcript.value = newPartialTranscript; // Atualiza transcript principal também
+        console.log(`📝 Transcrição parcial atualizada: ${newPartialTranscript.length} caracteres`);
+      }
+    } catch (e) {
+      console.error('❌ Erro ao atualizar transcrição parcial:', e);
+    }
+  };
+
+  // Função para parar chunking automático
+  const stopRealTimeChunking = async () => {
+    if (chunkingInterval) {
+      clearInterval(chunkingInterval);
+      chunkingInterval = null;
+    }
+
+    // Processa último chunk se houver dados
+    if (isRecording.value && audioChunks.length > 0) {
+      console.log('🔄 Processando último chunk...');
+      await processCurrentChunk();
+    }
+
+    // Aguarda chunks ativos terminarem (timeout aumentado para 90s)
+    let waitCount = 0;
+    while (realTimeTranscription.value.activeChunks.size > 0 && waitCount < 90) {
+      console.log(`⏳ Aguardando ${realTimeTranscription.value.activeChunks.size} chunks ativos... (${waitCount}/90s)`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      waitCount++;
+    }
+
+    // Log estatísticas finais
+    const finalStats = logChunkStats();
+    console.log('🛑 Chunking automático finalizado');
+    console.log('📈 Estatísticas finais da sessão:', finalStats);
+  };
+
   // Função simplificada para configurar MediaRecorder (método Notion)
   const setupRecording = async (stream) => {
     try {
@@ -323,8 +944,11 @@ export function useRecorder() {
         }
       };
 
-      mediaRecorder.onstop = () => {
+      mediaRecorder.onstop = async () => {
         console.log('🛑 Finalizando gravação...');
+
+        // Para chunking automático
+        await stopRealTimeChunking();
 
         if (audioChunks.length > 0) {
           audioBlob.value = new Blob(audioChunks, { type: mimeType });
@@ -348,6 +972,9 @@ export function useRecorder() {
       // Iniciar gravação (método Notion)
       mediaRecorder.start(1000); // Chunks de 1 segundo
       isRecording.value = true;
+
+      // Iniciar chunking automático
+      startRealTimeChunking();
 
       console.log('✅ Gravação iniciada com sucesso (método Notion)!');
 
@@ -446,7 +1073,7 @@ export function useRecorder() {
       const base64Audio = await blobToBase64(audioBlob.value);
       const prompt = `Você receberá o áudio de uma reunião corporativa. Faça apenas a transcrição completa e fiel em português do Brasil, corrigindo erros de dicção óbvios e removendo muletas ("éé", "ahn", "tipo"). Mantenha todos os nomes citados. Retorne apenas o texto transcrito, sem formatação adicional ou comentários.`;
 
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${GEMINI_API_KEY}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -626,10 +1253,7 @@ export function useRecorder() {
           }
 
           // Adiciona ao transcript final
-          if (fullTranscript && processedText.trim()) {
-            fullTranscript += ' ';
-          }
-          fullTranscript += processedText;
+          fullTranscript = mergeAndClean(fullTranscript, processedText);
 
           // Atualiza contexto para próximo chunk
           previousContext = extractContextForNextChunk(fullTranscript, processedText);
@@ -672,6 +1296,7 @@ export function useRecorder() {
       console.log(`   🔇 Cortes em silêncio: ${silenceCuts}`);
       console.log(`   📝 Tamanho final: ${fullTranscript.length} caracteres`);
 
+      fullTranscript = finalizeTranscriptCleaning(fullTranscript);
       transcript.value = fullTranscript;
       finalizeChunkProgress();
 
@@ -829,7 +1454,7 @@ export function useRecorder() {
               // Usar método inline para chunks menores
               const base64Audio = await blobToBase64(chunk);
 
-              const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+              const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -871,10 +1496,7 @@ export function useRecorder() {
           chunkTranscript = removeSimpleOverlap(chunkTranscript, fullTranscript);
         }
 
-        if (fullTranscript && chunkTranscript.trim()) {
-          fullTranscript += '\n\n';
-        }
-        fullTranscript += chunkTranscript.trim();
+        fullTranscript = mergeAndClean(fullTranscript, chunkTranscript.trim());
 
         // Rate limiting para Gemini
         if (i < chunks.length - 1) {
@@ -886,6 +1508,7 @@ export function useRecorder() {
         throw new Error('Nenhuma transcrição foi obtida dos chunks após todas as tentativas.');
       }
 
+      fullTranscript = finalizeTranscriptCleaning(fullTranscript);
       transcript.value = fullTranscript;
       console.log('✅ Transcrição Gemini unificada finalizada');
       return fullTranscript;
@@ -919,7 +1542,7 @@ export function useRecorder() {
       await waitForFileProcessing(fileUri, apiKey);
 
       // 3. Transcrever
-      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${apiKey}`, {
+      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key=${apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1291,31 +1914,70 @@ export function useRecorder() {
     isProcessing.value = true;
     error.value = null;
     try {
-      const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
-      if (!apiKey) throw new Error('Chave da API ausente (.env).');
+      // Usa OpenAI ChatGPT em vez do Gemini
+      if (!OPENAI_API_KEY) throw new Error('Chave da API OpenAI não configurada.');
 
-      const prompt = `Você receberá a transcrição de uma reunião corporativa. Produza APENAS o JSON final (sem markdown, sem comentários) seguindo as regras abaixo rigorosamente.\n\nOBJETIVO: Gerar um RESUMO ESTRUTURADO com título inteligente e pontos principais organizados de forma direta e prática.\n\nREGRAS:\n1. titulo_reuniao: Crie um título descritivo e inteligente baseado no contexto da reunião (ex: "Mentoria de Desenvolvimento de Carreira", "Planejamento Sprint Q4", etc.)\n2. contexto_e_objetivo: Breve contexto da reunião e objetivo principal (1-2 frases).\n3. participantes: Array com TODOS os nomes mencionados na reunião. Se não houver nomes específicos, usar ["Participantes não identificados"].\n4. pontos_principais: Array de objetos com os tópicos específicos discutidos. QUEBRE EM SUBTÓPICOS MENORES E ESPECÍFICOS. Cada objeto deve ter:\n   - "subtitulo": nome/título específico do subtópico (ex: "Melhorar tela de login", "Código único de oferta", "Problema com autenticação", "Configurar servidor de desenvolvimento")\n   - "pontos_abordados": array com 2-4 pontos específicos do que foi falado sobre esse subtópico (ex: ["jesiel falou para mudar as cores do fundo", "ajustar as bordas para ficar mais arredondadas"])\n5. action_items: TODAS as ações mencionadas. Formato: { "descricao": "ação específica", "responsavel": "nome ou 'A definir'", "prazo": "prazo mencionado ou 'Não definido'", "concluida": false }\n6. decisoes_tomadas: Array com decisões concretas tomadas durante a reunião.\n7. proximos_passos: Próximas etapas estratégicas mencionadas.\n\nIMPORTANTE: Para os pontos_principais, QUEBRE EM MUITOS SUBTÓPICOS ESPECÍFICOS ao invés de poucos tópicos grandes. Cada subtópico deve ter entre 2-4 pontos abordados. Seja específico e direto. Capture exatamente o que foi dito, incluindo quem falou o quê. Use linguagem natural e direta.\n\nEXEMPLO CORRETO de pontos_principais (muitos subtópicos específicos):\n[\n  {\n    "subtitulo": "Cores da tela de login",\n    "pontos_abordados": [\n      "jesiel falou para mudar as cores do fundo",\n      "usar tons mais escuros"\n    ]\n  },\n  {\n    "subtitulo": "Bordas dos elementos",\n    "pontos_abordados": [\n      "ajustar as bordas para ficar mais arredondadas",\n      "aplicar border-radius de 8px"\n    ]\n  },\n  {\n    "subtitulo": "Tipografia dos botões",\n    "pontos_abordados": [\n      "revisar tipografia dos botões",\n      "usar fonte maior para melhor legibilidade"\n    ]\n  },\n  {\n    "subtitulo": "Localização do código único",\n    "pontos_abordados": [\n      "está presente no book",\n      "seguindo a documentação o código único já vem do book porém precisa achar ele"\n    ]\n  },\n  {\n    "subtitulo": "Verificação com backend",\n    "pontos_abordados": [\n      "verificar com o time de backend onde está localizado",\n      "agendar reunião para entender a estrutura"\n    ]\n  }\n]\n\nNÃO FAÇA subtópicos muito grandes com muitos pontos. PREFIRA vários subtópicos específicos e menores.\n\nFORMATO EXATO DO RETORNO (JSON ÚNICO):\n{\n  "titulo_reuniao": "...",\n  "contexto_e_objetivo": "...",\n  "participantes": ["..."],\n  "pontos_principais": [\n    {\n      "subtitulo": "...",\n      "pontos_abordados": ["...", "...", "..."]\n    }\n  ],\n  "action_items": [{"descricao": "...", "responsavel": "...", "prazo": "...", "concluida": false}],\n  "decisoes_tomadas": ["..."],\n  "proximos_passos": ["..."],\n  "formato_estruturado": true\n}\n\nTranscrição da reunião:\n${transcript.value}\n\nRetorne somente o JSON completo e detalhado no formato estruturado.`;
+      // Inicializa OpenAI Chat se necessário
+      if (!openaiChat) {
+        openaiChat = new OpenAIChat();
+        await openaiChat.initialize(OPENAI_API_KEY, OPENAI_ORG_ID);
+      }
 
-      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.6, maxOutputTokens: 8000 }
-        })
+      console.log('🤖 Gerando resumo com ChatGPT');
+      const summaryResult = await openaiChat.generateSummary(transcript.value, {
+        model: 'gpt-3.5-turbo',
+        temperature: 0.3,
+        max_tokens: 4000
       });
-      if (!resp.ok) throw new Error('Erro da API: ' + await resp.text());
-      const data = await resp.json();
-      const raw = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('\n') || '';
-      console.log('🔍 Resposta bruta da IA (nova gravação):', raw);
 
-      const match = raw.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error('JSON não encontrado na resposta da IA.');
-      const parsed = JSON.parse(match[0]);
-      console.log('📋 JSON parsed (nova gravação):', parsed);
+      // Se retornou um JSON estruturado
+      if (typeof summaryResult === 'object' && summaryResult.formato_estruturado) {
+        return {
+          titulo_reuniao: summaryResult.titulo_reuniao || 'Reunião',
+          contexto_e_objetivo: summaryResult.contexto_e_objetivo || '',
+          participantes: summaryResult.participantes || ['Participantes não identificados'],
+          pontos_principais: summaryResult.pontos_principais || [],
+          action_items: summaryResult.action_items || [],
+          decisoes_tomadas: summaryResult.decisoes_tomadas || [],
+          proximos_passos: summaryResult.proximos_passos || [],
+          data_reuniao: new Date().toISOString(),
+          duracao_minutos: Math.round(getRecordingDuration() / 60 * 10) / 10,
+          fonte: 'Transcrição via Whisper + Análise via ChatGPT',
+          formato_estruturado: true
+        };
+      } else {
+        // Se retornou texto, tenta fazer parse
+        let parsed;
+        try {
+          const jsonMatch = summaryResult.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            parsed = JSON.parse(jsonMatch[0]);
+          } else {
+            throw new Error('JSON não encontrado na resposta');
+          }
+        } catch (parseError) {
+          // Fallback: retorna um resumo básico
+          return {
+            titulo_reuniao: 'Reunião',
+            contexto_e_objetivo: 'Resumo gerado automaticamente',
+            participantes: ['Participantes não identificados'],
+            pontos_principais: [
+              {
+                subtitulo: 'Resumo da reunião',
+                pontos_abordados: [summaryResult.substring(0, 500) + '...']
+              }
+            ],
+            action_items: [],
+            decisoes_tomadas: [],
+            proximos_passos: [],
+            data_reuniao: new Date().toISOString(),
+            duracao_minutos: Math.round(getRecordingDuration() / 60 * 10) / 10,
+            fonte: 'Transcrição via Whisper + Análise via ChatGPT',
+            formato_estruturado: true
+          };
+        }
 
-      // Suporte para formato estruturado (novo) e formato antigo (compatibilidade)
-      if (parsed.formato_estruturado) {
+        // Retorna o JSON parseado
         return {
           titulo_reuniao: parsed.titulo_reuniao || 'Reunião',
           contexto_e_objetivo: parsed.contexto_e_objetivo || '',
@@ -1326,22 +1988,8 @@ export function useRecorder() {
           proximos_passos: parsed.proximos_passos || [],
           data_reuniao: new Date().toISOString(),
           duracao_minutos: Math.round(getRecordingDuration() / 60 * 10) / 10,
-          fonte: 'Transcrição via Whisper + Análise via Gemini',
+          fonte: 'Transcrição via Whisper + Análise via ChatGPT',
           formato_estruturado: true
-        };
-      } else {
-        // Formato antigo (compatibilidade)
-        return {
-          contexto: parsed.contexto || '',
-          participantes: parsed.participantes || ['Participantes não identificados'],
-          pontos_discutidos: parsed.pontos_discutidos || [],
-          decisoes_tomadas: parsed.decisoes_tomadas || [],
-          tarefas_e_acoes: parsed.tarefas_e_acoes || [],
-          proximos_passos: parsed.proximos_passos || [],
-          observacoes: parsed.observacoes || [],
-          data_reuniao: new Date().toISOString(),
-          duracao_minutos: Math.round(getRecordingDuration() / 60 * 10) / 10,
-          fonte: 'Transcrição via Whisper + Análise via Gemini'
         };
       }
     } catch (e) {
@@ -1359,30 +2007,55 @@ export function useRecorder() {
     error.value = null;
 
     try {
-      const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
-      if (!apiKey) throw new Error('Chave da API ausente (.env).');
+      // Usa OpenAI ChatGPT em vez do Gemini
+      if (!OPENAI_API_KEY) throw new Error('Chave da API OpenAI não configurada.');
 
-      const prompt = `Você receberá a transcrição de uma reunião corporativa. Produza APENAS o JSON final (sem markdown, sem comentários) seguindo as regras abaixo rigorosamente.\n\nOBJETIVO: Gerar um RESUMO ESTRUTURADO com título inteligente e pontos principais organizados de forma direta e prática.\n\nREGRAS:\n1. titulo_reuniao: Crie um título descritivo e inteligente baseado no contexto da reunião (ex: "Mentoria de Desenvolvimento de Carreira", "Planejamento Sprint Q4", etc.)\n2. contexto_e_objetivo: Breve contexto da reunião e objetivo principal (1-2 frases).\n3. participantes: Array com TODOS os nomes mencionados na reunião. Se não houver nomes específicos, usar ["Participantes não identificados"].\n4. pontos_principais: Array de objetos com os tópicos específicos discutidos. QUEBRE EM SUBTÓPICOS MENORES E ESPECÍFICOS. Cada objeto deve ter:\n   - "subtitulo": nome/título específico do subtópico (ex: "Melhorar tela de login", "Código único de oferta", "Problema com autenticação", "Configurar servidor de desenvolvimento")\n   - "pontos_abordados": array com 2-4 pontos específicos do que foi falado sobre esse subtópico (ex: ["jesiel falou para mudar as cores do fundo", "ajustar as bordas para ficar mais arredondadas"])\n5. action_items: TODAS as ações mencionadas. Formato: { "descricao": "ação específica", "responsavel": "nome ou 'A definir'", "prazo": "prazo mencionado ou 'Não definido'", "concluida": false }\n6. decisoes_tomadas: Array com decisões concretas tomadas durante a reunião.\n7. proximos_passos: Próximas etapas estratégicas mencionadas.\n\nIMPORTANTE: Para os pontos_principais, QUEBRE EM MUITOS SUBTÓPICOS ESPECÍFICOS ao invés de poucos tópicos grandes. Cada subtópico deve ter entre 2-4 pontos abordados. Seja específico e direto. Capture exatamente o que foi dito, incluindo quem falou o quê. Use linguagem natural e direta.\n\nEXEMPLO CORRETO de pontos_principais (muitos subtópicos específicos):\n[\n  {\n    "subtitulo": "Cores da tela de login",\n    "pontos_abordados": [\n      "jesiel falou para mudar as cores do fundo",\n      "usar tons mais escuros"\n    ]\n  },\n  {\n    "subtitulo": "Bordas dos elementos",\n    "pontos_abordados": [\n      "ajustar as bordas para ficar mais arredondadas",\n      "aplicar border-radius de 8px"\n    ]\n  },\n  {\n    "subtitulo": "Tipografia dos botões",\n    "pontos_abordados": [\n      "revisar tipografia dos botões",\n      "usar fonte maior para melhor legibilidade"\n    ]\n  },\n  {\n    "subtitulo": "Localização do código único",\n    "pontos_abordados": [\n      "está presente no book",\n      "seguindo a documentação o código único já vem do book porém precisa achar ele"\n    ]\n  },\n  {\n    "subtitulo": "Verificação com backend",\n    "pontos_abordados": [\n      "verificar com o time de backend onde está localizado",\n      "agendar reunião para entender a estrutura"\n    ]\n  }\n]\n\nNÃO FAÇA subtópicos muito grandes com muitos pontos. PREFIRA vários subtópicos específicos e menores.\n\nFORMATO EXATO DO RETORNO (JSON ÚNICO):\n{\n  "titulo_reuniao": "...",\n  "contexto_e_objetivo": "...",\n  "participantes": ["..."],\n  "pontos_principais": [\n    {\n      "subtitulo": "...",\n      "pontos_abordados": ["...", "...", "..."]\n    }\n  ],\n  "action_items": [{"descricao": "...", "responsavel": "...", "prazo": "...", "concluida": false}],\n  "decisoes_tomadas": ["..."],\n  "proximos_passos": ["..."],\n  "formato_estruturado": true\n}\n\nTranscrição da reunião:\n${transcriptText}\n\nRetorne somente o JSON completo e detalhado no formato estruturado.`;
+      // Inicializa OpenAI Chat se necessário
+      if (!openaiChat) {
+        openaiChat = new OpenAIChat();
+        await openaiChat.initialize(OPENAI_API_KEY, OPENAI_ORG_ID);
+      }
 
-      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.6, maxOutputTokens: 8000 }
-        })
+      console.log('🤖 Regenerando resumo com ChatGPT');
+      const summaryResult = await openaiChat.generateSummary(transcriptText, {
+        model: 'gpt-3.5-turbo',
+        temperature: 0.3,
+        max_tokens: 4000
       });
 
-      if (!resp.ok) throw new Error('Erro da API: ' + await resp.text());
+      let parsed;
 
-      const data = await resp.json();
-      const raw = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('\n') || '';
-      console.log('🔍 Resposta bruta da IA (regeneração):', raw);
-
-      const match = raw.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error('JSON não encontrado na resposta da IA.');
-      const parsed = JSON.parse(match[0]);
-      console.log('📋 JSON parsed (regeneração):', parsed);
+      // Se retornou um JSON estruturado
+      if (typeof summaryResult === 'object' && summaryResult.formato_estruturado) {
+        parsed = summaryResult;
+      } else {
+        // Se retornou texto, tenta fazer parse
+        try {
+          const jsonMatch = summaryResult.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            parsed = JSON.parse(jsonMatch[0]);
+          } else {
+            throw new Error('JSON não encontrado na resposta');
+          }
+        } catch (parseError) {
+          // Fallback: retorna um resumo básico
+          parsed = {
+            titulo_reuniao: 'Reunião',
+            contexto_e_objetivo: 'Resumo gerado automaticamente',
+            participantes: ['Participantes não identificados'],
+            pontos_principais: [
+              {
+                subtitulo: 'Resumo da reunião',
+                pontos_abordados: [summaryResult.substring(0, 500) + '...']
+              }
+            ],
+            action_items: [],
+            decisoes_tomadas: [],
+            proximos_passos: [],
+            formato_estruturado: true
+          };
+        }
+      }
 
       const result = {
         titulo_reuniao: parsed.titulo_reuniao || 'Reunião',
@@ -1394,7 +2067,7 @@ export function useRecorder() {
         proximos_passos: parsed.proximos_passos || [],
         data_reuniao: new Date().toISOString(),
         duracao_minutos: originalDuration,
-        fonte: 'Regeneração: Transcrição via Whisper + Análise via Gemini',
+        fonte: 'Regeneração: Transcrição via Whisper + Análise via ChatGPT',
         formato_estruturado: true,
         // Limpar campos do formato antigo para evitar conflitos
         pontos_discutidos: undefined,
@@ -1431,8 +2104,9 @@ export function useRecorder() {
       OPENAI_API_KEY = apiKey.trim();
       OPENAI_ORG_ID = organizationId;
 
-      // Reset da instância para forçar reinicialização
+      // Reset das instâncias para forçar reinicialização
       openaiTranscription = null;
+      openaiChat = null;
 
       console.log('🔑 OpenAI API Key configurada');
       return true;
@@ -1440,6 +2114,7 @@ export function useRecorder() {
     OPENAI_API_KEY = '';
     OPENAI_ORG_ID = null;
     openaiTranscription = null;
+    openaiChat = null;
     return false;
   };
 
@@ -1584,6 +2259,10 @@ export function useRecorder() {
     chunkProgress,
     getProgressPercentage,
     getProgressSummary,
+    // Transcrição em tempo real
+    realTimeTranscription,
+    // Cache
+    cache,
     // Funções
     startRecording,
     stopRecording,

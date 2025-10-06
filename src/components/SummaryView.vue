@@ -844,9 +844,30 @@ const toggleTask = (taskIndex) => {
   toggleTaskHistory(props.meeting.id, taskIndex);
 };
 
-const copyTranscript = async () => {
+const copyTranscript = async (event) => {
   try {
-    await navigator.clipboard.writeText(props.meeting.transcript);
+    // Tenta usar a API moderna do clipboard
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(props.meeting.transcript);
+    } else {
+      // Fallback para ambientes sem suporte à API moderna
+      const textArea = document.createElement('textarea');
+      textArea.value = props.meeting.transcript;
+      textArea.style.position = 'fixed';
+      textArea.style.left = '-999999px';
+      textArea.style.top = '-999999px';
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+
+      const successful = document.execCommand('copy');
+      document.body.removeChild(textArea);
+
+      if (!successful) {
+        throw new Error('Falha ao copiar usando execCommand');
+      }
+    }
+
     // Feedback visual temporário
     const button = event.target;
     const originalText = button.textContent;
@@ -856,7 +877,61 @@ const copyTranscript = async () => {
     }, 2000);
   } catch (err) {
     console.error("Erro ao copiar:", err);
-    alert("Erro ao copiar transcrição.");
+
+    // Última opção: mostrar modal com texto para cópia manual
+    const textarea = document.createElement('textarea');
+    textarea.value = props.meeting.transcript;
+    textarea.style.width = '100%';
+    textarea.style.height = '200px';
+    textarea.readOnly = true;
+
+    const modal = document.createElement('div');
+    modal.style.cssText = `
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0,0,0,0.5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+    `;
+
+    const content = document.createElement('div');
+    content.style.cssText = `
+      background: white;
+      padding: 20px;
+      border-radius: 8px;
+      max-width: 80%;
+      max-height: 80%;
+    `;
+
+    const title = document.createElement('h3');
+    title.textContent = 'Copie o texto abaixo:';
+    title.style.marginBottom = '10px';
+
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = 'Fechar';
+    closeBtn.style.cssText = `
+      margin-top: 10px;
+      padding: 8px 16px;
+      background: #3b82f6;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    `;
+    closeBtn.onclick = () => document.body.removeChild(modal);
+
+    content.appendChild(title);
+    content.appendChild(textarea);
+    content.appendChild(closeBtn);
+    modal.appendChild(content);
+    document.body.appendChild(modal);
+
+    textarea.select();
   }
 };
 

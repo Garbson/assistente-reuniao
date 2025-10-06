@@ -44,6 +44,15 @@
     <!-- Conteúdo principal -->
     <div class="flex-1 overflow-y-auto p-6">
 
+      <!-- Indicador de Transcrição em Tempo Real -->
+      <RealTimeTranscriptionIndicator
+        v-if="isRecording || (realTimeTranscription && realTimeTranscription.sessionId)"
+        :real-time-transcription="realTimeTranscription"
+        :cache="cache"
+        @toggle-real-time="toggleRealTimeTranscription"
+        @clear-cache="clearTranscriptionCache"
+      />
+
       <!-- Botão de teste de captura de áudio -->
       <AudioTestButton v-if="!isRecording" />
 
@@ -140,6 +149,7 @@ import {
 
 // UI Components
 import PostRecordingActions from "./recorder/PostRecordingActions.vue";
+import RealTimeTranscriptionIndicator from "./recorder/RealTimeTranscriptionIndicator.vue";
 import RecordingControls from "./recorder/RecordingControls.vue";
 import TranscriptDisplay from "./recorder/TranscriptDisplay.vue";
 import AlertBox from "./ui/AlertBox.vue";
@@ -177,6 +187,9 @@ const {
   isCapturingOutput,
   audioQuality,
   detectedMeetingApp,
+  // Transcrição em tempo real
+  realTimeTranscription,
+  cache,
 } = useRecorder();
 
 const { saveMeeting } = useHistory();
@@ -357,7 +370,16 @@ const saveWithoutSummary = () => {
   }
 };
 
+// Funções de controle da transcrição em tempo real
+const toggleRealTimeTranscription = () => {
+  realTimeTranscription.value.enabled = !realTimeTranscription.value.enabled;
+  console.log('🔄 Transcrição em tempo real:', realTimeTranscription.value.enabled ? 'Ativada' : 'Desativada');
+};
 
+const clearTranscriptionCache = () => {
+  cache.clearAllCache();
+  console.log('🗑️ Cache de transcrições limpo');
+};
 
 // Watchers
 watch(isRecording, (newValue) => {
