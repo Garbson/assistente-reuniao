@@ -11,6 +11,17 @@ export function useRecorder() {
   const hasAudio = ref(false);
   const audioBlob = ref(null);
 
+  // Estados para progress tracking
+  const chunkProgress = ref({
+    isProcessingChunks: false,
+    currentChunk: 0,
+    totalChunks: 0,
+    currentPhase: '', // 'splitting', 'transcribing', 'merging'
+    chunkDetails: [],
+    estimatedTimeRemaining: 0,
+    startTime: null
+  });
+
   // Estado da captura de áudio
   const audioCaptureType = ref('unknown'); // 'system', 'microfone', 'hybrid', 'unknown'
   const isCapturingFullMeeting = ref(false); // true se capturando áudio de todos
@@ -388,8 +399,9 @@ export function useRecorder() {
           console.log('🚀 Usando OpenAI Whisper (oficial)');
 
           // Para arquivos grandes, usa chunking otimizado do Whisper
+          // Baseado na documentação oficial: modelos são robustos mas podem alucinar em áudios longos
           if (fileSizeMB > 20 || durationMinutes > 25) {
-            console.log('📦 Arquivo grande detectado, processando em chunks otimizados...');
+            console.log('📦 Arquivo grande detectado, processando em chunks otimizados (recomendação oficial Whisper)...');
             return await transcribeAudioInChunksWhisper();
           }
 
@@ -398,7 +410,7 @@ export function useRecorder() {
             model: 'whisper-1',
             language: 'pt',
             temperature: 0.0,
-            prompt: 'Esta é uma transcrição de uma reunião corporativa em português brasileiro. Incluir nomes próprios, termos técnicos e evitar palavras de preenchimento.'
+            prompt: 'Transcrição de reunião corporativa em português brasileiro. Incluir nomes próprios e termos técnicos. Evitar alucinações - transcrever apenas o que é efetivamente falado.'
           });
 
           transcript.value = transcriptText;
@@ -479,78 +491,199 @@ export function useRecorder() {
     }
   };
 
-  // Nova função de chunking otimizada para Whisper
+  // Nova função de chunking otimizada para Whisper com timestamps precisos
   const transcribeAudioInChunksWhisper = async () => {
     try {
       console.log('🔄 Processando áudio longo com chunks otimizados para Whisper...');
 
       // Chunks de 30 segundos conforme recomendação do Whisper
       const CHUNK_DURATION_SECONDS = 30;
-      const OVERLAP_SECONDS = 2; // Overlap para evitar cortes no meio de palavras
+      const OVERLAP_SECONDS = 5; // Overlap de 5s para melhor continuidade
 
-      const chunks = await splitAudioIntoOptimizedChunks(audioBlob.value, CHUNK_DURATION_SECONDS, OVERLAP_SECONDS);
-      console.log(`📦 Dividido em ${chunks.length} chunks de 30s com overlap`);
+      // Inicializa progress tracking
+      initializeChunkProgress(0, 'splitting');
+
+      const result = await splitAudioIntoOptimizedChunks(audioBlob.value, CHUNK_DURATION_SECONDS, OVERLAP_SECONDS);
+      const chunks = result.chunks || result; // Compatibilidade com retorno antigo
+      const metadata = result.metadata || [];
+
+      console.log(`📦 Dividido em ${chunks.length} chunks de 30s com overlap de 5s`);
+
+      // Atualiza progress com total de chunks
+      chunkProgress.value.totalChunks = chunks.length;
+      updateChunkProgress(0, 'transcribing');
 
       let fullTranscript = '';
-      let previousContext = ''; // Para manter contexto entre chunks
+      let transcriptSegments = []; // Para tracking detalhado
+      let previousContext = '';
+      const processedChunks = [];
 
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
+        const chunkMeta = metadata[i] || { startTime: i * (CHUNK_DURATION_SECONDS - OVERLAP_SECONDS), endTime: (i + 1) * (CHUNK_DURATION_SECONDS - OVERLAP_SECONDS) };
         const chunkSizeMB = chunk.size / (1024 * 1024);
 
         console.log(`📤 Processando chunk ${i + 1}/${chunks.length} (${chunkSizeMB.toFixed(1)}MB)`);
+        console.log(`⏱️ Tempo: ${chunkMeta.startTime?.toFixed(1)}s - ${chunkMeta.endTime?.toFixed(1)}s`);
 
-        try {
-          // Prompt contextual para manter continuidade
-          const contextualPrompt = i === 0
-            ? 'Esta é uma transcrição de uma reunião corporativa em português brasileiro. Incluir nomes próprios, termos técnicos e evitar palavras de preenchimento.'
-            : `Continuação da reunião. Contexto anterior: "${previousContext}". Manter consistência de nomes e termos.`;
+        let chunkResult = null;
+        let retryCount = 0;
+        const maxRetries = 3;
 
-          const chunkTranscript = await openaiTranscription.transcribe(chunk, {
-            model: 'whisper-1',
-            language: 'pt',
-            temperature: 0.0,
-            prompt: contextualPrompt
-          });
+        // Sistema de retry robusto com validação
+        while (!chunkResult && retryCount < maxRetries) {
+          try {
+            // Validação do chunk antes da transcrição
+            if (retryCount === 0) { // Só valida na primeira tentativa
+              const validation = await openaiTranscription.validateChunk(chunk, i);
+              if (!validation.isValid) {
+                throw new Error(`Chunk inválido: ${validation.errors.join(', ')}`);
+              }
+              if (validation.warnings.length > 0) {
+                console.warn(`⚠️ Chunk ${i + 1} com avisos:`, validation.warnings);
+              }
+            }
 
-          // Remove overlap duplicado (primeiras palavras se é chunk > 0)
-          let processedTranscript = chunkTranscript.trim();
-          if (i > 0 && fullTranscript) {
-            // Tenta remover sobreposição simples
-            const lastWords = fullTranscript.split(' ').slice(-5).join(' ');
-            const firstWords = processedTranscript.split(' ').slice(0, 5).join(' ');
+            // Prompt contextual inteligente
+            const contextualPrompt = buildContextualPrompt(i, previousContext, chunkMeta);
 
-            // Se há similaridade, remove as primeiras palavras do chunk atual
-            if (lastWords.toLowerCase().includes(firstWords.toLowerCase().substring(0, 20))) {
-              processedTranscript = processedTranscript.split(' ').slice(3).join(' ');
+            const transcriptionOptions = {
+              model: 'whisper-1',
+              language: 'pt',
+              temperature: retryCount * 0.1, // Aumenta temperatura em retries
+              response_format: 'verbose_json', // Para timestamps precisos
+              prompt: contextualPrompt,
+              timestamp_granularities: ['segment'] // Para obter timestamps de segmentos
+            };
+
+            // Se for retry, usa método otimizado
+            const chunkTranscript = retryCount === 0
+              ? await openaiTranscription.transcribe(chunk, transcriptionOptions)
+              : await openaiTranscription.retryWithOptimizedSettings(chunk, transcriptionOptions, retryCount + 1);
+
+            chunkResult = {
+              text: typeof chunkTranscript === 'string' ? chunkTranscript : chunkTranscript.text,
+              segments: chunkTranscript.segments || [],
+              rawResponse: chunkTranscript,
+              metadata: chunkMeta,
+              retryCount
+            };
+
+            processedChunks.push(chunkResult);
+            console.log(`✅ Chunk ${i + 1} processado (tentativa ${retryCount + 1})`);
+
+            // Atualiza progress tracking
+            updateChunkProgress(i + 1, 'transcribing', {
+              status: 'success',
+              sizeMB: chunkSizeMB,
+              duration: chunkMeta.endTime - chunkMeta.startTime,
+              retryCount
+            });
+
+          } catch (chunkError) {
+            retryCount++;
+            console.warn(`⚠️ Chunk ${i + 1} falhou (tentativa ${retryCount}/${maxRetries}):`, chunkError.message);
+
+            if (retryCount >= maxRetries) {
+              console.error(`❌ Chunk ${i + 1} falhou após ${maxRetries} tentativas`);
+              chunkResult = {
+                text: `[Erro na transcrição do segmento ${i + 1} - tempo ${chunkMeta.startTime?.toFixed(1)}s-${chunkMeta.endTime?.toFixed(1)}s]`,
+                segments: [],
+                error: chunkError.message,
+                metadata: chunkMeta,
+                retryCount
+              };
+              processedChunks.push(chunkResult);
+
+              // Atualiza progress tracking para erro
+              updateChunkProgress(i + 1, 'transcribing', {
+                status: 'error',
+                error: chunkError.message,
+                retryCount
+              });
+            } else {
+              // Aguarda antes de retry
+              await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
             }
           }
+        }
 
-          if (fullTranscript && processedTranscript.trim()) {
+        // Processa o resultado do chunk
+        if (chunkResult && chunkResult.text) {
+          let processedText = chunkResult.text.trim();
+
+          // Remove overlap usando timestamps quando disponível
+          if (i > 0 && chunkResult.segments && processedChunks[i - 1]?.segments) {
+            processedText = removeOverlapUsingTimestamps(
+              processedText,
+              chunkResult.segments,
+              processedChunks[i - 1],
+              OVERLAP_SECONDS
+            );
+          } else if (i > 0 && fullTranscript) {
+            // Fallback para remoção de overlap simples
+            processedText = removeSimpleOverlap(processedText, fullTranscript);
+          }
+
+          // Adiciona ao transcript final
+          if (fullTranscript && processedText.trim()) {
             fullTranscript += ' ';
           }
-          fullTranscript += processedTranscript.trim();
+          fullTranscript += processedText;
 
-          // Atualiza contexto para próximo chunk (últimas palavras)
-          previousContext = fullTranscript.split(' ').slice(-10).join(' ');
+          // Atualiza contexto para próximo chunk
+          previousContext = extractContextForNextChunk(fullTranscript, processedText);
 
-          // Pequena pausa para evitar rate limiting
-          if (i < chunks.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 500));
-          }
+          // Tracking detalhado
+          transcriptSegments.push({
+            chunkIndex: i,
+            startTime: chunkMeta.startTime,
+            endTime: chunkMeta.endTime,
+            text: processedText,
+            originalLength: chunkResult.text.length,
+            processedLength: processedText.length,
+            hadSilenceCut: chunkMeta.hasSilenceCut || false,
+            retryCount: chunkResult.retryCount
+          });
+        }
 
-        } catch (chunkError) {
-          console.error(`❌ Erro no chunk ${i + 1}:`, chunkError);
-          fullTranscript += ` [Erro na transcrição do segmento ${i + 1}] `;
+        // Rate limiting inteligente
+        if (i < chunks.length - 1) {
+          const delay = retryCount > 0 ? 1000 : 500;
+          await new Promise(resolve => setTimeout(resolve, delay));
         }
       }
 
       if (!fullTranscript.trim()) {
-        throw new Error('Nenhuma transcrição foi obtida dos chunks.');
+        throw new Error('Nenhuma transcrição foi obtida dos chunks após todas as tentativas.');
       }
 
+      // Log de estatísticas finais
+      const successfulChunks = processedChunks.filter(c => !c.error).length;
+      const totalRetries = processedChunks.reduce((sum, c) => sum + c.retryCount, 0);
+      const silenceCuts = transcriptSegments.filter(s => s.hadSilenceCut).length;
+
+      // Finaliza progress tracking
+      updateChunkProgress(chunks.length, 'merging');
+
+      console.log(`✅ Transcrição em chunks finalizada:`);
+      console.log(`   📊 Chunks processados: ${successfulChunks}/${chunks.length}`);
+      console.log(`   🔄 Total de retries: ${totalRetries}`);
+      console.log(`   🔇 Cortes em silêncio: ${silenceCuts}`);
+      console.log(`   📝 Tamanho final: ${fullTranscript.length} caracteres`);
+
       transcript.value = fullTranscript;
-      console.log('✅ Transcrição em chunks finalizada');
+      finalizeChunkProgress();
+
+      // Armazena metadata para debugging se necessário
+      if (window.DEBUG_CHUNKS) {
+        window.lastChunkingResult = {
+          segments: transcriptSegments,
+          chunks: processedChunks,
+          fullTranscript
+        };
+      }
+
       return fullTranscript;
 
     } catch (e) {
@@ -559,80 +692,206 @@ export function useRecorder() {
     }
   };
 
-  const transcribeAudioInChunks = async () => {
-    const apiKey = GEMINI_API_KEY;
-    const CHUNK_DURATION_MS = 10 * 60 * 1000; // 10 minutos por chunk
+  // Constrói prompt contextual inteligente
+  const buildContextualPrompt = (chunkIndex, previousContext, metadata) => {
+    if (chunkIndex === 0) {
+      return 'Transcrição de reunião corporativa em português brasileiro. Incluir nomes próprios e termos técnicos. Evitar alucinações - transcrever apenas o que é efetivamente falado.';
+    }
+
+    const silenceInfo = metadata?.hasSilenceCut ? ' Este segmento foi cortado em uma pausa natural.' : '';
+    const timeInfo = metadata?.startTime ? ` Segmento iniciando em ${metadata.startTime.toFixed(1)}s.` : '';
+
+    return `Continuação da reunião corporativa.${timeInfo}${silenceInfo} Contexto anterior: "${previousContext}". Manter consistência de nomes, termos técnicos e estilo de linguagem.`;
+  };
+
+  // Remove overlap usando informações de timestamp
+  const removeOverlapUsingTimestamps = (currentText, currentSegments, previousChunk, overlapSeconds) => {
+    if (!currentSegments?.length || !previousChunk?.segments?.length) {
+      return removeSimpleOverlap(currentText, previousChunk.text);
+    }
 
     try {
-      console.log('🔄 Processando áudio longo em chunks...');
+      // Encontra palavras que provavelmente são overlap baseado no tempo
+      const overlapThreshold = overlapSeconds * 0.8; // 80% do overlap real
+      const wordsToRemove = currentSegments.filter(segment =>
+        segment.start && segment.start < overlapThreshold
+      );
 
-      const chunks = await splitAudioIntoChunks(audioBlob.value, CHUNK_DURATION_MS);
-      console.log(`📦 Dividido em ${chunks.length} chunks`);
+      if (wordsToRemove.length > 0) {
+        const firstNonOverlapIndex = currentSegments.findIndex(segment =>
+          !segment.start || segment.start >= overlapThreshold
+        );
+
+        if (firstNonOverlapIndex > 0) {
+          const remainingSegments = currentSegments.slice(firstNonOverlapIndex);
+          const cleanedText = remainingSegments.map(s => s.text || '').join(' ').trim();
+
+          console.log(`🧹 Overlap removido via timestamps: ${wordsToRemove.length} palavras`);
+          return cleanedText || currentText;
+        }
+      }
+
+      return currentText;
+    } catch (e) {
+      console.warn('⚠️ Erro ao remover overlap via timestamps, usando método simples:', e);
+      return removeSimpleOverlap(currentText, previousChunk.text);
+    }
+  };
+
+  // Remove overlap simples (fallback)
+  const removeSimpleOverlap = (currentText, previousFullText) => {
+    try {
+      const currentWords = currentText.trim().split(/\s+/);
+      const previousWords = previousFullText.trim().split(/\s+/);
+
+      if (currentWords.length < 3 || previousWords.length < 5) {
+        return currentText;
+      }
+
+      // Procura por sequências de 3-5 palavras que se repetem
+      for (let overlapLength = Math.min(5, currentWords.length); overlapLength >= 3; overlapLength--) {
+        const currentStart = currentWords.slice(0, overlapLength).join(' ').toLowerCase();
+        const previousEnd = previousWords.slice(-overlapLength * 2).join(' ').toLowerCase();
+
+        if (previousEnd.includes(currentStart)) {
+          const cleaned = currentWords.slice(overlapLength).join(' ');
+          if (cleaned.trim()) {
+            console.log(`🧹 Overlap simples removido: ${overlapLength} palavras`);
+            return cleaned;
+          }
+        }
+      }
+
+      return currentText;
+    } catch (e) {
+      console.warn('⚠️ Erro na remoção de overlap simples:', e);
+      return currentText;
+    }
+  };
+
+  // Extrai contexto para o próximo chunk
+  const extractContextForNextChunk = (fullTranscript, lastProcessedText) => {
+    try {
+      // Pega últimas 15-20 palavras como contexto
+      const allWords = fullTranscript.trim().split(/\s+/);
+      const contextWords = allWords.slice(-20).join(' ');
+
+      // Remove pontuação desnecessária para melhor matching
+      return contextWords.replace(/[.,;:!?]/g, '').trim();
+    } catch (e) {
+      console.warn('⚠️ Erro ao extrair contexto:', e);
+      return lastProcessedText.split(/\s+/).slice(-10).join(' ');
+    }
+  };
+
+  // Função unificada de chunking para Gemini (fallback do Whisper)
+  const transcribeAudioInChunks = async () => {
+    const apiKey = GEMINI_API_KEY;
+
+    try {
+      console.log('🔄 Processando áudio longo com Gemini (chunks unificados)...');
+
+      // Usa a mesma função otimizada, mas com chunks maiores para Gemini
+      const CHUNK_DURATION_SECONDS = 10 * 60; // 10 minutos para Gemini
+      const OVERLAP_SECONDS = 30; // 30s de overlap para Gemini
+
+      const result = await splitAudioIntoOptimizedChunks(audioBlob.value, CHUNK_DURATION_SECONDS, OVERLAP_SECONDS);
+      const chunks = result.chunks || result;
+      const metadata = result.metadata || [];
+
+      console.log(`📦 Dividido em ${chunks.length} chunks de 10min com overlap de 30s (Gemini)`);
 
       let fullTranscript = '';
-      const prompt = `Você receberá parte do áudio de uma reunião corporativa. Faça apenas a transcrição completa e fiel em português do Brasil, corrigindo erros de dicção óbvios e removendo muletas ("éé", "ahn", "tipo"). Mantenha todos os nomes citados. Retorne apenas o texto transcrito, sem formatação adicional ou comentários.`;
+      const basePrompt = `Você receberá parte do áudio de uma reunião corporativa. Faça apenas a transcrição completa e fiel em português do Brasil, corrigindo erros de dicção óbvios e removendo muletas ("éé", "ahn", "tipo"). Mantenha todos os nomes citados. Retorne apenas o texto transcrito, sem formatação adicional ou comentários.`;
 
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
+        const chunkMeta = metadata[i] || { startTime: i * (CHUNK_DURATION_SECONDS - OVERLAP_SECONDS) };
         const chunkSizeMB = chunk.size / (1024 * 1024);
 
-        console.log(`📤 Processando chunk ${i + 1}/${chunks.length} (${chunkSizeMB.toFixed(1)}MB)`);
+        console.log(`📤 Processando chunk ${i + 1}/${chunks.length} (${chunkSizeMB.toFixed(1)}MB) - Gemini`);
 
-        try {
-          let chunkTranscript = '';
+        let retryCount = 0;
+        const maxRetries = 2;
+        let chunkTranscript = '';
 
-          // Se chunk ainda é muito grande, usar Files API
-          if (chunkSizeMB > 10) {
-            chunkTranscript = await transcribeChunkWithFilesAPI(chunk, prompt, apiKey, i + 1);
-          } else {
-            // Usar método inline para chunks menores
-            const base64Audio = await blobToBase64(chunk);
+        // Sistema de retry para Gemini
+        while (!chunkTranscript.trim() && retryCount < maxRetries) {
+          try {
+            const contextualPrompt = i === 0
+              ? basePrompt
+              : `${basePrompt} Este é um segmento de continuação da reunião (parte ${i + 1}/${chunks.length}).`;
 
-            const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: chunk.type || 'audio/webm', data: base64Audio } }] }],
-                generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
-              })
-            });
-
-            if (!resp.ok) {
-              const errorText = await resp.text();
-              console.error(`❌ Erro no chunk ${i + 1}:`, errorText);
-              chunkTranscript = `[Erro na transcrição do chunk ${i + 1}]`;
+            // Se chunk é muito grande, usar Files API
+            if (chunkSizeMB > 10) {
+              chunkTranscript = await transcribeChunkWithFilesAPI(chunk, contextualPrompt, apiKey, i + 1);
             } else {
+              // Usar método inline para chunks menores
+              const base64Audio = await blobToBase64(chunk);
+
+              const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  contents: [{ parts: [{ text: contextualPrompt }, { inline_data: { mime_type: chunk.type || 'audio/webm', data: base64Audio } }] }],
+                  generationConfig: {
+                    temperature: 0.3 + (retryCount * 0.1),
+                    maxOutputTokens: 8000
+                  }
+                })
+              });
+
+              if (!resp.ok) {
+                const errorText = await resp.text();
+                throw new Error(`Erro no chunk ${i + 1}: ${errorText}`);
+              }
+
               const data = await resp.json();
-              chunkTranscript = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('\n') || `[Chunk ${i + 1} vazio]`;
+              chunkTranscript = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('\n') || '';
+            }
+
+            if (chunkTranscript.trim()) {
+              console.log(`✅ Chunk ${i + 1} processado com Gemini (tentativa ${retryCount + 1})`);
+            }
+
+          } catch (chunkError) {
+            retryCount++;
+            console.warn(`⚠️ Chunk ${i + 1} falhou (tentativa ${retryCount}/${maxRetries}):`, chunkError.message);
+
+            if (retryCount >= maxRetries) {
+              chunkTranscript = `[Erro na transcrição do segmento ${i + 1} - tempo ${chunkMeta.startTime?.toFixed(0) || 'N/A'}s: ${chunkError.message}]`;
+            } else {
+              await new Promise(resolve => setTimeout(resolve, 2000));
             }
           }
+        }
 
-          if (fullTranscript && chunkTranscript.trim()) {
-            fullTranscript += '\n\n';
-          }
-          fullTranscript += chunkTranscript.trim();
+        // Remove overlap simples para Gemini (sem timestamps detalhados)
+        if (i > 0 && fullTranscript && chunkTranscript.trim()) {
+          chunkTranscript = removeSimpleOverlap(chunkTranscript, fullTranscript);
+        }
 
-          // Pequena pausa para evitar rate limiting
-          if (i < chunks.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-          }
+        if (fullTranscript && chunkTranscript.trim()) {
+          fullTranscript += '\n\n';
+        }
+        fullTranscript += chunkTranscript.trim();
 
-        } catch (chunkError) {
-          console.error(`❌ Erro no chunk ${i + 1}:`, chunkError);
-          fullTranscript += `\n\n[Erro na transcrição do segmento ${i + 1}: ${chunkError.message}]`;
+        // Rate limiting para Gemini
+        if (i < chunks.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 1500));
         }
       }
 
       if (!fullTranscript.trim()) {
-        throw new Error('Nenhuma transcrição foi obtida dos chunks.');
+        throw new Error('Nenhuma transcrição foi obtida dos chunks após todas as tentativas.');
       }
 
       transcript.value = fullTranscript;
-      console.log('✅ Transcrição completa finalizada');
+      console.log('✅ Transcrição Gemini unificada finalizada');
       return fullTranscript;
 
     } catch (e) {
-      console.error('❌ Erro ao processar áudio em chunks:', e);
+      console.error('❌ Erro ao processar áudio em chunks (Gemini):', e);
       throw new Error(`Erro ao processar áudio longo: ${e.message}`);
     }
   };
@@ -698,11 +957,12 @@ export function useRecorder() {
     }
   };
 
-  // Função otimizada para dividir áudio em chunks de 30s com overlap
+  // Função otimizada para dividir áudio em chunks com detecção de silêncio inteligente
   const splitAudioIntoOptimizedChunks = async (audioBlob, chunkDurationSeconds, overlapSeconds) => {
     const chunks = [];
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     const audioContext = new AudioContextClass();
+    const MAX_CHUNK_SIZE_MB = 24; // Limite de segurança (25MB - 1MB buffer)
 
     try {
       // Decodifica o áudio para obter informações precisas
@@ -710,44 +970,258 @@ export function useRecorder() {
       const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice());
 
       const totalDurationSeconds = audioBuffer.duration;
-      const chunkDurationMs = chunkDurationSeconds * 1000;
-      const overlapMs = overlapSeconds * 1000;
+      const sampleRate = audioBuffer.sampleRate;
+      const numberOfChannels = audioBuffer.numberOfChannels;
       const effectiveChunkDuration = chunkDurationSeconds - overlapSeconds;
 
-      const numChunks = Math.ceil(totalDurationSeconds / effectiveChunkDuration);
+      console.log(`🎵 Áudio total: ${(totalDurationSeconds / 60).toFixed(1)} min, ${numberOfChannels} canais, ${sampleRate}Hz`);
 
-      console.log(`🎵 Áudio total: ${(totalDurationSeconds / 60).toFixed(1)} min, dividindo em ${numChunks} chunks de ${chunkDurationSeconds}s`);
+      // Detecta pontos de silêncio para cortes inteligentes
+      const silenceThreshold = 0.01; // Limiar de silêncio (ajustável)
+      const minSilenceDuration = 0.3; // Mínimo 300ms de silêncio para considerar
+      const silencePoints = await detectSilencePoints(audioBuffer, silenceThreshold, minSilenceDuration);
 
-      // Calcula bytes por segundo para divisão aproximada
-      const bytesPerSecond = audioBlob.size / totalDurationSeconds;
+      console.log(`🔇 Encontrados ${silencePoints.length} pontos de silêncio para cortes inteligentes`);
 
-      for (let i = 0; i < numChunks; i++) {
-        const startTimeSeconds = i * effectiveChunkDuration;
-        const endTimeSeconds = Math.min(startTimeSeconds + chunkDurationSeconds, totalDurationSeconds);
+      const targetChunks = Math.ceil(totalDurationSeconds / effectiveChunkDuration);
+      const chunkMetadata = [];
+      let currentStartTime = 0;
 
-        const startByte = Math.floor(startTimeSeconds * bytesPerSecond);
-        const endByte = Math.floor(endTimeSeconds * bytesPerSecond);
+      for (let i = 0; i < targetChunks && currentStartTime < totalDurationSeconds; i++) {
+        const idealEndTime = currentStartTime + chunkDurationSeconds;
+        const maxEndTime = Math.min(idealEndTime + 5, totalDurationSeconds); // +5s tolerância
 
-        const chunkBlob = audioBlob.slice(startByte, endByte, audioBlob.type);
-        chunks.push(chunkBlob);
+        // Encontra o melhor ponto de corte (silêncio) próximo ao tempo ideal
+        let actualEndTime = Math.min(idealEndTime, totalDurationSeconds);
 
-        console.log(`📦 Chunk ${i + 1}: ${startTimeSeconds.toFixed(1)}-${endTimeSeconds.toFixed(1)}s (${(chunkBlob.size / 1024 / 1024).toFixed(1)}MB)`);
+        if (i < targetChunks - 1) { // Não é o último chunk
+          const bestSilencePoint = findBestSilencePoint(silencePoints, idealEndTime - 2, idealEndTime + 3);
+          if (bestSilencePoint !== null) {
+            actualEndTime = bestSilencePoint;
+            console.log(`🎯 Chunk ${i + 1}: usando ponto de silêncio em ${actualEndTime.toFixed(1)}s`);
+          }
+        }
+
+        // Cria o chunk de áudio usando Web Audio API para maior precisão
+        const startSample = Math.floor(currentStartTime * sampleRate);
+        const endSample = Math.floor(actualEndTime * sampleRate);
+        const chunkLength = endSample - startSample;
+
+        const chunkBuffer = audioContext.createBuffer(numberOfChannels, chunkLength, sampleRate);
+
+        // Copia os dados de áudio para o novo buffer
+        for (let channel = 0; channel < numberOfChannels; channel++) {
+          const sourceData = audioBuffer.getChannelData(channel);
+          const chunkData = chunkBuffer.getChannelData(channel);
+          for (let sample = 0; sample < chunkLength; sample++) {
+            chunkData[sample] = sourceData[startSample + sample] || 0;
+          }
+        }
+
+        // Converte o AudioBuffer de volta para blob
+        const chunkBlob = await audioBufferToBlob(chunkBuffer, audioBlob.type);
+        const chunkSizeMB = chunkBlob.size / (1024 * 1024);
+
+        // Validação de tamanho
+        if (chunkSizeMB > MAX_CHUNK_SIZE_MB) {
+          console.warn(`⚠️ Chunk ${i + 1} muito grande (${chunkSizeMB.toFixed(1)}MB), reduzindo...`);
+          // Reduz a duração em 10% e tenta novamente
+          actualEndTime = currentStartTime + (actualEndTime - currentStartTime) * 0.9;
+          const newEndSample = Math.floor(actualEndTime * sampleRate);
+          const newChunkLength = newEndSample - startSample;
+
+          const reducedBuffer = audioContext.createBuffer(numberOfChannels, newChunkLength, sampleRate);
+          for (let channel = 0; channel < numberOfChannels; channel++) {
+            const sourceData = audioBuffer.getChannelData(channel);
+            const chunkData = reducedBuffer.getChannelData(channel);
+            for (let sample = 0; sample < newChunkLength; sample++) {
+              chunkData[sample] = sourceData[startSample + sample] || 0;
+            }
+          }
+
+          const reducedBlob = await audioBufferToBlob(reducedBuffer, audioBlob.type);
+          chunks.push(reducedBlob);
+
+          console.log(`📦 Chunk ${i + 1}: ${currentStartTime.toFixed(1)}-${actualEndTime.toFixed(1)}s (${(reducedBlob.size / 1024 / 1024).toFixed(1)}MB) [REDUZIDO]`);
+        } else {
+          chunks.push(chunkBlob);
+          console.log(`📦 Chunk ${i + 1}: ${currentStartTime.toFixed(1)}-${actualEndTime.toFixed(1)}s (${chunkSizeMB.toFixed(1)}MB)`);
+        }
+
+        // Metadata para tracking preciso
+        chunkMetadata.push({
+          index: i,
+          startTime: currentStartTime,
+          endTime: actualEndTime,
+          duration: actualEndTime - currentStartTime,
+          sizeMB: chunkBlob.size / (1024 * 1024),
+          hasSilenceCut: silencePoints.some(p => Math.abs(p - actualEndTime) < 0.5)
+        });
+
+        // Próximo chunk inicia com overlap
+        currentStartTime = Math.max(0, actualEndTime - overlapSeconds);
       }
 
-      return chunks;
+      console.log(`✅ Dividido em ${chunks.length} chunks inteligentes com detecção de silêncio`);
+      return { chunks, metadata: chunkMetadata };
 
     } catch (e) {
-      console.error('❌ Erro ao dividir áudio em chunks otimizados:', e);
-      // Fallback: usa divisão simples por tamanho
-      const simpleChunkSize = Math.ceil(audioBlob.size / Math.ceil(audioBlob.size / (20 * 1024 * 1024))); // ~20MB por chunk
-      const chunks = [];
-      for (let i = 0; i < audioBlob.size; i += simpleChunkSize) {
-        chunks.push(audioBlob.slice(i, i + simpleChunkSize, audioBlob.type));
-      }
-      return chunks;
+      console.error('❌ Erro ao dividir áudio com detecção de silêncio:', e);
+      // Fallback: usa divisão simples por tamanho com limite de segurança
+      const chunks = await createFallbackChunks(audioBlob, MAX_CHUNK_SIZE_MB);
+      return { chunks, metadata: null };
     } finally {
-      audioContext.close();
+      if (audioContext.state !== 'closed') {
+        audioContext.close();
+      }
     }
+  };
+
+  // Função auxiliar para detectar pontos de silêncio
+  const detectSilencePoints = async (audioBuffer, threshold, minDuration) => {
+    const sampleRate = audioBuffer.sampleRate;
+    const numberOfChannels = audioBuffer.numberOfChannels;
+    const minSilenceSamples = Math.floor(minDuration * sampleRate);
+    const silencePoints = [];
+
+    // Analisa em janelas de 100ms para detectar silêncio
+    const windowSize = Math.floor(0.1 * sampleRate); // 100ms
+    const totalSamples = audioBuffer.length;
+
+    for (let start = 0; start < totalSamples - windowSize; start += windowSize) {
+      let isSilent = true;
+      let silentSamples = 0;
+
+      // Verifica todas as amostras na janela
+      for (let sample = start; sample < Math.min(start + windowSize * 5, totalSamples); sample++) {
+        let amplitude = 0;
+
+        // Calcula RMS (Root Mean Square) para todos os canais
+        for (let channel = 0; channel < numberOfChannels; channel++) {
+          const channelData = audioBuffer.getChannelData(channel);
+          amplitude += Math.abs(channelData[sample] || 0);
+        }
+
+        amplitude /= numberOfChannels;
+
+        if (amplitude > threshold) {
+          if (silentSamples >= minSilenceSamples) {
+            // Encontrou um período de silêncio suficientemente longo
+            const silenceTime = (start + silentSamples / 2) / sampleRate;
+            silencePoints.push(silenceTime);
+          }
+          silentSamples = 0;
+          isSilent = false;
+        } else {
+          silentSamples++;
+        }
+      }
+
+      // Se terminou com silêncio, adiciona o ponto
+      if (silentSamples >= minSilenceSamples) {
+        const silenceTime = (start + silentSamples / 2) / sampleRate;
+        silencePoints.push(silenceTime);
+      }
+    }
+
+    return silencePoints.filter((point, index, arr) =>
+      index === 0 || point - arr[index - 1] > 1.0 // Remove pontos muito próximos (< 1s)
+    );
+  };
+
+  // Encontra o melhor ponto de silêncio dentro de uma janela de tempo
+  const findBestSilencePoint = (silencePoints, minTime, maxTime) => {
+    const candidatePoints = silencePoints.filter(point => point >= minTime && point <= maxTime);
+
+    if (candidatePoints.length === 0) return null;
+
+    // Retorna o ponto mais próximo do centro da janela
+    const centerTime = (minTime + maxTime) / 2;
+    return candidatePoints.reduce((best, current) =>
+      Math.abs(current - centerTime) < Math.abs(best - centerTime) ? current : best
+    );
+  };
+
+  // Converte AudioBuffer para Blob
+  const audioBufferToBlob = async (audioBuffer, mimeType) => {
+    const numberOfChannels = audioBuffer.numberOfChannels;
+    const sampleRate = audioBuffer.sampleRate;
+    const length = audioBuffer.length;
+
+    // Cria um novo AudioContext para renderização
+    const offlineContext = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(
+      numberOfChannels, length, sampleRate
+    );
+
+    // Cria um buffer source
+    const source = offlineContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(offlineContext.destination);
+    source.start(0);
+
+    // Renderiza o áudio
+    const renderedBuffer = await offlineContext.startRendering();
+
+    // Converte para WAV (mais compatível que webm para processamento)
+    const wavBlob = audioBufferToWav(renderedBuffer);
+    return wavBlob;
+  };
+
+  // Converte AudioBuffer para WAV blob
+  const audioBufferToWav = (audioBuffer) => {
+    const numberOfChannels = audioBuffer.numberOfChannels;
+    const sampleRate = audioBuffer.sampleRate;
+    const length = audioBuffer.length;
+
+    const buffer = new ArrayBuffer(44 + length * numberOfChannels * 2);
+    const view = new DataView(buffer);
+
+    // WAV header
+    const writeString = (offset, string) => {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    };
+
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + length * numberOfChannels * 2, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, numberOfChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * numberOfChannels * 2, true);
+    view.setUint16(32, numberOfChannels * 2, true);
+    view.setUint16(34, 16, true);
+    writeString(36, 'data');
+    view.setUint32(40, length * numberOfChannels * 2, true);
+
+    // Audio data
+    let offset = 44;
+    for (let i = 0; i < length; i++) {
+      for (let channel = 0; channel < numberOfChannels; channel++) {
+        const sample = Math.max(-1, Math.min(1, audioBuffer.getChannelData(channel)[i]));
+        view.setInt16(offset, sample * 0x7FFF, true);
+        offset += 2;
+      }
+    }
+
+    return new Blob([buffer], { type: 'audio/wav' });
+  };
+
+  // Função de fallback para criar chunks simples
+  const createFallbackChunks = async (audioBlob, maxSizeMB) => {
+    const chunks = [];
+    const maxSizeBytes = maxSizeMB * 1024 * 1024;
+    const chunkSize = Math.min(maxSizeBytes, Math.ceil(audioBlob.size / Math.ceil(audioBlob.size / maxSizeBytes)));
+
+    for (let i = 0; i < audioBlob.size; i += chunkSize) {
+      chunks.push(audioBlob.slice(i, Math.min(i + chunkSize, audioBlob.size), audioBlob.type));
+    }
+
+    console.log(`📦 Fallback: dividido em ${chunks.length} chunks simples de ~${(chunkSize / 1024 / 1024).toFixed(1)}MB`);
+    return chunks;
   };
 
   const splitAudioIntoChunks = async (audioBlob, chunkDurationMs) => {
@@ -1008,6 +1482,73 @@ export function useRecorder() {
     stopAudioAnalysis();
   };
 
+  // Funções para progress tracking
+  const initializeChunkProgress = (totalChunks, phase = 'splitting') => {
+    chunkProgress.value = {
+      isProcessingChunks: true,
+      currentChunk: 0,
+      totalChunks,
+      currentPhase: phase,
+      chunkDetails: [],
+      estimatedTimeRemaining: 0,
+      startTime: Date.now()
+    };
+  };
+
+  const updateChunkProgress = (currentChunk, phase = null, chunkDetail = null) => {
+    if (phase) chunkProgress.value.currentPhase = phase;
+    chunkProgress.value.currentChunk = currentChunk;
+
+    if (chunkDetail) {
+      chunkProgress.value.chunkDetails.push({
+        index: currentChunk,
+        timestamp: Date.now(),
+        ...chunkDetail
+      });
+    }
+
+    // Calcula tempo estimado restante
+    if (currentChunk > 0 && chunkProgress.value.startTime) {
+      const elapsed = Date.now() - chunkProgress.value.startTime;
+      const avgTimePerChunk = elapsed / currentChunk;
+      const remainingChunks = chunkProgress.value.totalChunks - currentChunk;
+      chunkProgress.value.estimatedTimeRemaining = Math.round(avgTimePerChunk * remainingChunks / 1000); // em segundos
+    }
+  };
+
+  const finalizeChunkProgress = () => {
+    chunkProgress.value.isProcessingChunks = false;
+    chunkProgress.value.currentPhase = 'completed';
+    const totalTime = chunkProgress.value.startTime ? (Date.now() - chunkProgress.value.startTime) / 1000 : 0;
+    console.log(`📊 Chunking finalizado em ${totalTime.toFixed(1)}s - ${chunkProgress.value.totalChunks} chunks processados`);
+  };
+
+  const getProgressPercentage = () => {
+    if (!chunkProgress.value.isProcessingChunks || chunkProgress.value.totalChunks === 0) return 0;
+    return Math.round((chunkProgress.value.currentChunk / chunkProgress.value.totalChunks) * 100);
+  };
+
+  const getProgressSummary = () => {
+    const progress = chunkProgress.value;
+    if (!progress.isProcessingChunks) return null;
+
+    const phaseNames = {
+      'splitting': 'Dividindo áudio',
+      'transcribing': 'Transcrevendo',
+      'merging': 'Finalizando',
+      'completed': 'Concluído'
+    };
+
+    return {
+      percentage: getProgressPercentage(),
+      phase: phaseNames[progress.currentPhase] || progress.currentPhase,
+      current: progress.currentChunk,
+      total: progress.totalChunks,
+      timeRemaining: progress.estimatedTimeRemaining,
+      details: progress.chunkDetails.slice(-3) // Últimos 3 detalhes
+    };
+  };
+
   onMounted(() => {
     checkSupport();
     setupElectronListener();
@@ -1039,6 +1580,10 @@ export function useRecorder() {
     isCapturingOutput,
     audioQuality,
     detectedMeetingApp,
+    // Progress tracking
+    chunkProgress,
+    getProgressPercentage,
+    getProgressSummary,
     // Funções
     startRecording,
     stopRecording,

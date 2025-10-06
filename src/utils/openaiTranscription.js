@@ -65,7 +65,8 @@ export class OpenAITranscription {
       language = 'pt',
       temperature = 0.0,
       response_format = 'json',
-      prompt = null
+      prompt = null,
+      timestamp_granularities = null // Para verbose_json
     } = options;
 
     try {
@@ -88,6 +89,17 @@ export class OpenAITranscription {
 
       if (prompt) {
         formData.append('prompt', prompt);
+      }
+
+      // Adiciona timestamp granularities para verbose_json
+      if (response_format === 'verbose_json' && timestamp_granularities) {
+        if (Array.isArray(timestamp_granularities)) {
+          timestamp_granularities.forEach(granularity => {
+            formData.append('timestamp_granularities[]', granularity);
+          });
+        } else {
+          formData.append('timestamp_granularities[]', timestamp_granularities);
+        }
       }
 
       // Prepara headers
@@ -136,14 +148,37 @@ export class OpenAITranscription {
 
       const result = await response.json();
 
-      if (!result.text || !result.text.trim()) {
-        throw new Error('Transcrição vazia retornada pelo OpenAI');
+      // Validação diferente baseada no formato de resposta
+      if (response_format === 'verbose_json') {
+        if (!result.text || !result.text.trim()) {
+          throw new Error('Transcrição vazia retornada pelo OpenAI (verbose_json)');
+        }
+
+        console.log('✅ Transcrição OpenAI concluída (verbose_json)');
+        console.log(`📝 Tamanho da transcrição: ${result.text.length} caracteres`);
+        console.log(`🕒 Duração detectada: ${result.duration?.toFixed(1)}s`);
+        console.log(`🎯 Segmentos: ${result.segments?.length || 0}`);
+        console.log(`💬 Palavras: ${result.words?.length || 0}`);
+
+        // Retorna o objeto completo para verbose_json
+        return {
+          text: result.text.trim(),
+          language: result.language,
+          duration: result.duration,
+          segments: result.segments || [],
+          words: result.words || []
+        };
+      } else {
+        // Formato padrão (text ou json)
+        if (!result.text || !result.text.trim()) {
+          throw new Error('Transcrição vazia retornada pelo OpenAI');
+        }
+
+        console.log('✅ Transcrição OpenAI concluída');
+        console.log(`📝 Tamanho da transcrição: ${result.text.length} caracteres`);
+
+        return result.text.trim();
       }
-
-      console.log('✅ Transcrição OpenAI concluída');
-      console.log(`📝 Tamanho da transcrição: ${result.text.length} caracteres`);
-
-      return result.text.trim();
 
     } catch (error) {
       console.error('❌ Erro na transcrição OpenAI:', error);
@@ -228,5 +263,133 @@ export class OpenAITranscription {
       costUSD: cost.toFixed(4),
       costBRL: (cost * 5.5).toFixed(2) // Estimativa USD->BRL
     };
+  }
+
+  // Valida qualidade e características do chunk antes da transcrição
+  async validateChunk(audioBlob, chunkIndex = 0) {
+    const validation = {
+      isValid: true,
+      warnings: [],
+      errors: [],
+      metadata: {
+        sizeMB: (audioBlob.size / (1024 * 1024)).toFixed(2),
+        sizeBytes: audioBlob.size,
+        type: audioBlob.type,
+        chunkIndex
+      }
+    };
+
+    try {
+      // Validação de tamanho
+      const sizeMB = audioBlob.size / (1024 * 1024);
+      if (sizeMB > 25) {
+        validation.isValid = false;
+        validation.errors.push(`Chunk muito grande: ${sizeMB.toFixed(1)}MB (máx: 25MB)`);
+      } else if (sizeMB > 24) {
+        validation.warnings.push(`Chunk próximo do limite: ${sizeMB.toFixed(1)}MB`);
+      }
+
+      // Validação de tamanho mínimo
+      if (sizeMB < 0.01) { // 10KB
+        validation.warnings.push(`Chunk muito pequeno: ${sizeMB.toFixed(3)}MB - pode ter qualidade ruim`);
+      }
+
+      // Validação de tipo MIME
+      const supportedTypes = ['audio/webm', 'audio/wav', 'audio/mp3', 'audio/mpeg', 'audio/ogg'];
+      if (audioBlob.type && !supportedTypes.includes(audioBlob.type)) {
+        validation.warnings.push(`Tipo de áudio não testado: ${audioBlob.type}`);
+      }
+
+      // Validação básica de conteúdo (se possível)
+      if (window.AudioContext || window.webkitAudioContext) {
+        try {
+          const arrayBuffer = await audioBlob.arrayBuffer();
+          const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+          const audioContext = new AudioContextClass();
+
+          const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice());
+
+          validation.metadata.duration = audioBuffer.duration;
+          validation.metadata.sampleRate = audioBuffer.sampleRate;
+          validation.metadata.channels = audioBuffer.numberOfChannels;
+
+          // Validação de duração
+          if (audioBuffer.duration < 0.5) {
+            validation.warnings.push(`Duração muito curta: ${audioBuffer.duration.toFixed(1)}s`);
+          }
+
+          if (audioBuffer.duration > 35) { // Whisper recomenda 30s
+            validation.warnings.push(`Duração longa para chunk: ${audioBuffer.duration.toFixed(1)}s (ideal: 30s)`);
+          }
+
+          // Análise de amplitude média (detecta silêncio total)
+          let totalAmplitude = 0;
+          let sampleCount = 0;
+
+          for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
+            const channelData = audioBuffer.getChannelData(channel);
+            for (let i = 0; i < Math.min(channelData.length, 44100 * 5); i += 100) { // Amostra 5s
+              totalAmplitude += Math.abs(channelData[i]);
+              sampleCount++;
+            }
+          }
+
+          const avgAmplitude = totalAmplitude / sampleCount;
+          validation.metadata.avgAmplitude = avgAmplitude;
+
+          if (avgAmplitude < 0.001) {
+            validation.warnings.push('Chunk parece conter apenas silêncio');
+          }
+
+          audioContext.close();
+
+        } catch (audioError) {
+          validation.warnings.push(`Não foi possível analisar o áudio: ${audioError.message}`);
+        }
+      }
+
+      // Log de validação
+      if (validation.errors.length > 0) {
+        console.error(`❌ Chunk ${chunkIndex + 1} inválido:`, validation.errors);
+      } else if (validation.warnings.length > 0) {
+        console.warn(`⚠️ Chunk ${chunkIndex + 1} com avisos:`, validation.warnings);
+      } else {
+        console.log(`✅ Chunk ${chunkIndex + 1} validado com sucesso`);
+      }
+
+      return validation;
+
+    } catch (error) {
+      validation.isValid = false;
+      validation.errors.push(`Erro na validação: ${error.message}`);
+      return validation;
+    }
+  }
+
+  // Método auxiliar para recuperar chunks com problemas
+  async retryWithOptimizedSettings(audioBlob, originalOptions = {}, attempt = 1) {
+    const optimizedOptions = { ...originalOptions };
+
+    // Estratégias de otimização baseadas na tentativa
+    switch (attempt) {
+      case 2:
+        optimizedOptions.temperature = 0.1; // Temperatura mais alta
+        break;
+      case 3:
+        optimizedOptions.temperature = 0.2;
+        optimizedOptions.prompt = null; // Remove prompt que pode estar causando problemas
+        break;
+      case 4:
+        // Última tentativa: configurações mais permissivas
+        optimizedOptions.temperature = 0.3;
+        optimizedOptions.language = null; // Deixa o Whisper detectar
+        optimizedOptions.prompt = null;
+        break;
+      default:
+        break;
+    }
+
+    console.log(`🔄 Retry ${attempt} com configurações otimizadas:`, optimizedOptions);
+    return await this.transcribe(audioBlob, optimizedOptions);
   }
 }
