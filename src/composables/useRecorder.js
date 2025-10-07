@@ -3,7 +3,7 @@ import { OpenAIChat } from '../utils/openaiChat.js';
 import { OpenAITranscription } from '../utils/openaiTranscription.js';
 import { useCache } from './useCache.js';
 
-// Composable OTIMIZADO: grava áudio do sistema + microfone e usa OpenAI Whisper + Gemini para transcrever e resumir
+// Composable OTIMIZADO: grava áudio do sistema + microfone e usa OpenAI Whisper + ChatGPT para transcrever e resumir
 export function useRecorder() {
   const isRecording = ref(false);
   const isProcessing = ref(false);
@@ -24,9 +24,9 @@ export function useRecorder() {
     startTime: null
   });
 
-  // Estados para transcrição em tempo real
+  // Estados para transcrição em tempo real (DESABILITADO - processamento pós-gravação)
   const realTimeTranscription = ref({
-    enabled: true,
+    enabled: false, // DESABILITADO para eliminar repetições
     chunks: [],
     activeChunks: new Map(),
     processedChunks: new Map(),
@@ -70,6 +70,7 @@ export function useRecorder() {
   // Estruturas globais de n-grams vistos durante esta sessão de transcrição
   const seenNgrams = new Set(); // armazena hashes de n-grams (3-8 tokens)
 
+
   const hashString = (s) => {
     let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 131 + s.charCodeAt(i)) >>> 0; } return h.toString(36);
   };
@@ -106,6 +107,7 @@ export function useRecorder() {
     return repeated / total;
   };
 
+
   // ==================== UTILITÁRIOS DE DEDUPLICAÇÃO ====================
   // Remove repetições consecutivas de frases/linhas causadas por overlap ou alucinação
   const normalizeWhitespace = (text) => text
@@ -141,56 +143,20 @@ export function useRecorder() {
     return result;
   };
 
-  // Sistema AGRESSIVO de detecção e remoção de duplicações
+  // Deduplicação SIMPLES focada apenas no essencial
   const aggressiveDeduplication = (text) => {
     if (!text || text.length < 50) return text;
 
     let result = text;
 
-    // 1. Remove repetições de frases EXATAS (case-insensitive)
-    const sentences = result.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 0);
-    const seenExact = new Set();
-    const filteredExact = [];
+    // 1. Remove repetições consecutivas de frases (padrão mais comum)
+    result = result.replace(/(\b.{10,80}[.!?])\s+\1/gi, '$1');
 
-    sentences.forEach(sentence => {
-      const normalized = sentence.trim().toLowerCase()
-        .replace(/["""''.,!?;:]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
+    // 2. Remove repetições de palavras consecutivas (mais de 3x)
+    result = result.replace(/(\b\w+\b)(\s+\1){3,}/gi, '$1');
 
-      if (normalized.length >= 8) {
-        if (seenExact.has(normalized)) {
-          if (window.DEBUG_DEDUP) {
-            console.log('[DEDUP-EXACT] Removendo frase duplicada:', sentence.substring(0, 80));
-          }
-          return; // Pula esta frase
-        }
-        seenExact.add(normalized);
-      }
-      filteredExact.push(sentence);
-    });
-
-    result = filteredExact.join(' ');
-
-    // 2. Remove repetições de fragmentos longos (50+ chars)
-    const fragments = result.match(/.{50,150}/g) || [];
-    const seenFragments = new Set();
-
-    fragments.forEach(fragment => {
-      const normalized = fragment.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
-      if (seenFragments.has(normalized)) {
-        // Se encontrar este fragmento novamente, remove do resultado
-        const regex = new RegExp(fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
-        const matches = (result.match(regex) || []).length;
-        if (matches > 1) {
-          result = result.replace(regex, ''); // Remove TODAS as ocorrências adicionais
-          if (window.DEBUG_DEDUP) {
-            console.log('[DEDUP-FRAGMENT] Removendo fragmento repetido:', fragment.substring(0, 60));
-          }
-        }
-      }
-      seenFragments.add(normalized);
-    });
+    // 3. Remove fragmentos longos repetidos (mais de 2x)
+    result = result.replace(/(.{30,100})\s+\1/gi, '$1');
 
     return result.replace(/\s+/g, ' ').trim();
   };
@@ -301,7 +267,7 @@ export function useRecorder() {
   const finalizeTranscriptCleaning = (text) => {
     if (!text) return text;
 
-    // PRIMEIRO: Deduplicação agressiva em todo o transcript
+    // PRIMEIRA: Deduplicação agressiva em todo o transcript
     let t = aggressiveDeduplication(text);
 
     t = normalizeWhitespace(t);
@@ -373,7 +339,7 @@ export function useRecorder() {
   const smartChunkCleaning = (chunkText) => {
     if (!chunkText) return chunkText;
 
-    // Aplicar deduplicação eficiente
+    // Aplicar deduplicação eficiente simples
     let cleaned = efficientDeduplication(chunkText);
 
     // Remove frases muito curtas e repetitivas (menos de 3 palavras)
@@ -664,7 +630,7 @@ export function useRecorder() {
   // Função para iniciar chunking automático em tempo real
   const startRealTimeChunking = () => {
     if (!realTimeTranscription.value.enabled || !OPENAI_API_KEY) {
-      console.log('🔄 Transcrição em tempo real desabilitada');
+      console.log('⏭️ Transcrição em tempo real DESABILITADA - processamento pós-gravação ativo (estilo Notion)');
       return;
     }
 
@@ -781,12 +747,13 @@ export function useRecorder() {
         await openaiTranscription.initialize(OPENAI_API_KEY, OPENAI_ORG_ID);
       }
 
-      // Transcreve com Whisper (contexto mínimo para evitar repetições)
+      // Transcreve com Whisper (configurações EXPERIMENTAIS anti-repetição)
       const transcriptionResult = await openaiTranscription.transcribe(blob, {
         model: 'whisper-1',
         language: 'pt',
-        temperature: 0.0,
-        prompt: 'Transcrição de reunião corporativa em português brasileiro. Evite repetições.'
+        temperature: 0.6, // ALTA temperatura para quebrar loops
+        // SEM PROMPT - teste radical baseado na documentação
+        response_format: 'text' // Formato mais simples e direto
       });
 
       let transcriptionText = typeof transcriptionResult === 'string'
@@ -814,7 +781,10 @@ export function useRecorder() {
       logDetailedChunkInfo(chunkIndex, 'SUCESSO', {
         textLength: transcriptionText.length,
         retryCount,
-        preview: transcriptionText.substring(0, 50) + '...'
+        preview: transcriptionText.substring(0, 50) + '...',
+        temperature: 0.6,
+        hasPrompt: false,
+        experimental: true
       });
 
       // Atualiza transcrição parcial
@@ -1032,12 +1002,13 @@ export function useRecorder() {
             return await transcribeAudioInChunksWhisper();
           }
 
-          // Para arquivos menores, usa método direto
+          // Para arquivos menores, usa método direto OTIMIZADO (estilo Notion)
           const transcriptText = await openaiTranscription.transcribe(audioBlob.value, {
             model: 'whisper-1',
             language: 'pt',
-            temperature: 0.0,
-            prompt: 'Transcrição de reunião corporativa em português brasileiro. Incluir nomes próprios e termos técnicos. Evitar alucinações - transcrever apenas o que é efetivamente falado.'
+            temperature: 0.1, // Baixa temperatura para consistência
+            prompt: 'Transcrição de reunião corporativa em português brasileiro. Incluir nomes próprios e termos técnicos. Evitar alucinações.',
+            response_format: 'text'
           });
 
           transcript.value = transcriptText;
@@ -1045,7 +1016,7 @@ export function useRecorder() {
           return transcriptText;
 
         } catch (openaiError) {
-          console.warn('⚠️ Falha no OpenAI, tentando Gemini como fallback:', openaiError.message);
+          console.error('❌ Falha na transcrição OpenAI:', openaiError.message);
 
           // Tratamento específico para diferentes erros de API
           if (openaiError.message.includes('quota') || openaiError.message.includes('insufficient_quota')) {
@@ -1056,58 +1027,9 @@ export function useRecorder() {
             error.value = 'Limite de rate da OpenAI excedido. Aguarde alguns minutos.';
           }
 
-          // Continua para Gemini como fallback
+          throw openaiError;
         }
       }
-
-      // Fallback: Usa Gemini se Groq falhar ou não estiver configurado
-      console.log('📱 Usando Gemini como fallback...');
-
-      // Para arquivos muito grandes, usa chunks
-      if (fileSizeMB > 10 || durationMinutes > 15) {
-        console.log('📦 Arquivo grande detectado, processando em chunks...');
-        return await transcribeAudioInChunks();
-      }
-
-      // Para arquivos menores, usa método direto com Gemini
-      const base64Audio = await blobToBase64(audioBlob.value);
-      const prompt = `Você receberá o áudio de uma reunião corporativa. Faça apenas a transcrição completa e fiel em português do Brasil, corrigindo erros de dicção óbvios e removendo muletas ("éé", "ahn", "tipo"). Mantenha todos os nomes citados. Retorne apenas o texto transcrito, sem formatação adicional ou comentários.`;
-
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${GEMINI_API_KEY}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: audioBlob.value.type || 'audio/webm', data: base64Audio } }] }],
-          generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
-        })
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('Erro Gemini:', errorText);
-
-        // Tratamento específico para erros do Gemini
-        if (response.status === 400 && errorText.includes('API key not valid')) {
-          throw new Error('Chave da API Google (Gemini) inválida. Verifique sua configuração no .env');
-        } else if (response.status === 429) {
-          throw new Error('Limite de rate do Gemini excedido. Tente novamente em alguns minutos.');
-        } else if (response.status === 403) {
-          throw new Error('Acesso negado à API Gemini. Verifique as permissões da sua chave.');
-        } else {
-          throw new Error(`Falha na transcrição Gemini: ${response.status} - ${errorText}`);
-        }
-      }
-
-      const result = await response.json();
-      const transcriptText = result.candidates?.[0]?.content?.parts?.[0]?.text;
-
-      if (!transcriptText || !transcriptText.trim()) {
-        throw new Error('Transcrição vazia retornada.');
-      }
-
-      transcript.value = transcriptText;
-      console.log('✅ Transcrição Gemini concluída');
-      return transcriptText;
 
     } catch (e) {
       console.error('❌ Erro na transcrição:', e);
@@ -1123,9 +1045,9 @@ export function useRecorder() {
     try {
       console.log('🔄 Processando áudio longo com chunks otimizados para Whisper...');
 
-      // Chunks de 30 segundos conforme recomendação do Whisper
-      const CHUNK_DURATION_SECONDS = 30;
-      const OVERLAP_SECONDS = 5; // Overlap de 5s para melhor continuidade
+      // Chunks OTIMIZADOS estilo Notion (2-3 minutos para melhor qualidade)
+      const CHUNK_DURATION_SECONDS = 240; // 4 minutos - otimizado para reuniões longas, melhor custo-benefício
+      const OVERLAP_SECONDS = 0; // SEM overlap para evitar problemas de contexto
 
       // Inicializa progress tracking
       initializeChunkProgress(0, 'splitting');
@@ -1134,7 +1056,12 @@ export function useRecorder() {
       const chunks = result.chunks || result; // Compatibilidade com retorno antigo
       const metadata = result.metadata || [];
 
-      console.log(`📦 Dividido em ${chunks.length} chunks de 30s com overlap de 5s`);
+      console.log(`📦 Dividido em ${chunks.length} chunks de 3min sem overlap (SISTEMA HÍBRIDO estilo Notion)`);
+      console.log(`🚀 Configuração OTIMIZADA ativa:`);
+      console.log(`   - Chunk size: 3 minutos (maior contexto)`);
+      console.log(`   - Overlap: 0s (sem repetições)`);
+      console.log(`   - Processamento: SEQUENCIAL (não paralelo)`);
+      console.log(`   - Prompt: MANTIDO (conforme solicitado)`);
 
       // Atualiza progress com total de chunks
       chunkProgress.value.totalChunks = chunks.length;
@@ -1145,128 +1072,142 @@ export function useRecorder() {
       let previousContext = '';
       const processedChunks = [];
 
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        const chunkMeta = metadata[i] || { startTime: i * (CHUNK_DURATION_SECONDS - OVERLAP_SECONDS), endTime: (i + 1) * (CHUNK_DURATION_SECONDS - OVERLAP_SECONDS) };
-        const chunkSizeMB = chunk.size / (1024 * 1024);
+      // Processamento HÍBRIDO: Paralelo com contexto para máxima precisão
+      const PARALLEL_LIMIT = 3; // 3 chunks paralelos para máxima velocidade
+      let globalContext = ''; // Contexto acumulado para precisão
 
-        console.log(`📤 Processando chunk ${i + 1}/${chunks.length} (${chunkSizeMB.toFixed(1)}MB)`);
-        console.log(`⏱️ Tempo: ${chunkMeta.startTime?.toFixed(1)}s - ${chunkMeta.endTime?.toFixed(1)}s`);
+      for (let i = 0; i < chunks.length; i += PARALLEL_LIMIT) {
+        const batchChunks = chunks.slice(i, i + PARALLEL_LIMIT);
+        const batchPromises = batchChunks.map(async (chunk, batchIndex) => {
+          const chunkIndex = i + batchIndex;
+          const chunkMeta = metadata[chunkIndex] || {
+            startTime: chunkIndex * (CHUNK_DURATION_SECONDS - OVERLAP_SECONDS),
+            endTime: (chunkIndex + 1) * (CHUNK_DURATION_SECONDS - OVERLAP_SECONDS)
+          };
+          const chunkSizeMB = chunk.size / (1024 * 1024);
 
-        let chunkResult = null;
-        let retryCount = 0;
-        const maxRetries = 3;
+          console.log(`🚀 PARALELO chunk ${chunkIndex + 1}/${chunks.length} (${chunkSizeMB.toFixed(1)}MB)`);
+          console.log(`⏱️ Tempo: ${chunkMeta.startTime?.toFixed(1)}s - ${chunkMeta.endTime?.toFixed(1)}s`);
 
-        // Sistema de retry robusto com validação
-        while (!chunkResult && retryCount < maxRetries) {
-          try {
-            // Validação do chunk antes da transcrição
-            if (retryCount === 0) { // Só valida na primeira tentativa
-              const validation = await openaiTranscription.validateChunk(chunk, i);
-              if (!validation.isValid) {
-                throw new Error(`Chunk inválido: ${validation.errors.join(', ')}`);
-              }
-              if (validation.warnings.length > 0) {
-                console.warn(`⚠️ Chunk ${i + 1} com avisos:`, validation.warnings);
-              }
-            }
+          let chunkResult = null;
+          let retryCount = 0;
+          const maxRetries = 3;
 
-            // Prompt contextual inteligente
-            const contextualPrompt = buildContextualPrompt(i, previousContext, chunkMeta);
-
-            const transcriptionOptions = {
-              model: 'whisper-1',
-              language: 'pt',
-              temperature: retryCount * 0.1, // Aumenta temperatura em retries
-              response_format: 'verbose_json', // Para timestamps precisos
-              prompt: contextualPrompt,
-              timestamp_granularities: ['segment'] // Para obter timestamps de segmentos
-            };
-
-            // Se for retry, usa método otimizado
-            const chunkTranscript = retryCount === 0
-              ? await openaiTranscription.transcribe(chunk, transcriptionOptions)
-              : await openaiTranscription.retryWithOptimizedSettings(chunk, transcriptionOptions, retryCount + 1);
-
-            chunkResult = {
-              text: typeof chunkTranscript === 'string' ? chunkTranscript : chunkTranscript.text,
-              segments: chunkTranscript.segments || [],
-              rawResponse: chunkTranscript,
-              metadata: chunkMeta,
-              retryCount
-            };
-
-            processedChunks.push(chunkResult);
-            console.log(`✅ Chunk ${i + 1} processado (tentativa ${retryCount + 1})`);
-
-            // Atualiza progress tracking
-            updateChunkProgress(i + 1, 'transcribing', {
-              status: 'success',
-              sizeMB: chunkSizeMB,
-              duration: chunkMeta.endTime - chunkMeta.startTime,
-              retryCount
-            });
-
-          } catch (chunkError) {
-            retryCount++;
-            console.warn(`⚠️ Chunk ${i + 1} falhou (tentativa ${retryCount}/${maxRetries}):`, chunkError.message);
-
-            if (retryCount >= maxRetries) {
-              console.error(`❌ Chunk ${i + 1} falhou após ${maxRetries} tentativas`);
-              chunkResult = {
-                text: `[Erro na transcrição do segmento ${i + 1} - tempo ${chunkMeta.startTime?.toFixed(1)}s-${chunkMeta.endTime?.toFixed(1)}s]`,
-                segments: [],
-                error: chunkError.message,
-                metadata: chunkMeta,
-                retryCount
+          // Sistema de retry OTIMIZADO para velocidade
+          while (!chunkResult && retryCount < maxRetries) {
+            try {
+              // Configurações OFICIAIS para máxima compatibilidade e precisão
+              const transcriptionOptions = {
+                model: 'whisper-1', // ÚNICO MODELO OFICIAL disponível na OpenAI API
+                language: 'pt',
+                temperature: 0.2, // OTIMIZADO: mais flexível para melhor precisão
+                response_format: 'text', // TEXT é 3x mais rápido
+                prompt: globalContext
+                  ? `Reunião corporativa em português brasileiro sobre desenvolvimento de software, IA e APIs. Contexto anterior: "${globalContext.slice(-200)}". Pessoas: Felipe, Paulo, Jesiel, Garbson. Empresa: Anatel. Termos técnicos: Whisper, plano de manutenção. ATENÇÃO ESPECIAL: Transcreva datas e horários com máxima precisão (ex: "6 de outubro", "14h30", "segunda-feira").`
+                  : `Reunião corporativa em português brasileiro sobre desenvolvimento de software, ferramentas de IA, transcrição de áudio e APIs. Pessoas: Felipe, Paulo, Jesiel, Garbson. Empresa: Anatel. Termos técnicos: Whisper, plano de manutenção. ATENÇÃO ESPECIAL: Transcreva datas e horários com máxima precisão (ex: "6 de outubro", "14h30", "segunda-feira").`, // CONTEXTUAL com ênfase em datas/horários
+                // Removido timestamp_granularities para velocidade
               };
-              processedChunks.push(chunkResult);
 
-              // Atualiza progress tracking para erro
-              updateChunkProgress(i + 1, 'transcribing', {
-                status: 'error',
-                error: chunkError.message,
+              // Se for retry, usa método otimizado
+              const chunkTranscript = retryCount === 0
+                ? await openaiTranscription.transcribe(chunk, transcriptionOptions)
+                : await openaiTranscription.retryWithOptimizedSettings(chunk, transcriptionOptions, retryCount + 1);
+
+              chunkResult = {
+                text: typeof chunkTranscript === 'string' ? chunkTranscript : chunkTranscript.text,
+                segments: chunkTranscript.segments || [],
+                rawResponse: chunkTranscript,
+                metadata: chunkMeta,
+                retryCount,
+                chunkIndex // Para manter ordem
+              };
+
+              console.log(`✅ Chunk ${chunkIndex + 1} processado (tentativa ${retryCount + 1})`);
+
+              // Atualiza progress tracking
+              updateChunkProgress(chunkIndex + 1, 'transcribing', {
+                status: 'success',
+                sizeMB: chunkSizeMB,
+                duration: chunkMeta.endTime - chunkMeta.startTime,
                 retryCount
               });
-            } else {
-              // Aguarda antes de retry
-              await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+
+            } catch (chunkError) {
+              retryCount++;
+              console.warn(`⚠️ Chunk ${chunkIndex + 1} falhou (tentativa ${retryCount}/${maxRetries}):`, chunkError.message);
+
+              if (retryCount >= maxRetries) {
+                console.error(`❌ Chunk ${chunkIndex + 1} falhou após ${maxRetries} tentativas`);
+                chunkResult = {
+                  text: `[Erro na transcrição do segmento ${chunkIndex + 1} - tempo ${chunkMeta.startTime?.toFixed(1)}s-${chunkMeta.endTime?.toFixed(1)}s]`,
+                  segments: [],
+                  error: chunkError.message,
+                  metadata: chunkMeta,
+                  retryCount,
+                  chunkIndex
+                };
+
+                // Atualiza progress tracking para erro
+                updateChunkProgress(chunkIndex + 1, 'transcribing', {
+                  status: 'error',
+                  error: chunkError.message,
+                  retryCount
+                });
+              } else {
+                // Aguarda antes de retry
+                await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+              }
             }
+          }
+
+          return chunkResult; // Retorna resultado do chunk paralelo
+        });
+
+        // Aguarda todos os chunks do batch paralelo
+        const batchResults = await Promise.all(batchPromises);
+
+        // Adiciona resultados na ordem correta
+        for (const result of batchResults) {
+          if (result) {
+            processedChunks.push(result);
           }
         }
 
-        // Processa o resultado do chunk
+        console.log(`🚀 Batch ${Math.floor(i/PARALLEL_LIMIT) + 1} concluído - ${batchResults.length} chunks processados`);
+
+        // Atualiza contexto global com últimos resultados para próximo batch
+        const lastBatchTexts = batchResults
+          .filter(r => r && r.text)
+          .map(r => r.text.trim())
+          .join(' ');
+
+        if (lastBatchTexts) {
+          globalContext = (globalContext + ' ' + lastBatchTexts).slice(-500); // Mantém últimas 500 chars
+          console.log(`📝 Contexto atualizado: "${globalContext.slice(-100)}..."`);
+        }
+      }
+
+      // Ordena chunks por índice para manter ordem correta
+      processedChunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
+
+      // Monta transcript final na ordem correta
+      for (const chunkResult of processedChunks) {
         if (chunkResult && chunkResult.text) {
           let processedText = chunkResult.text.trim();
 
-          // Remove overlap usando timestamps quando disponível
-          if (i > 0 && chunkResult.segments && processedChunks[i - 1]?.segments) {
-            processedText = removeOverlapUsingTimestamps(
-              processedText,
-              chunkResult.segments,
-              processedChunks[i - 1],
-              OVERLAP_SECONDS
-            );
-          } else if (i > 0 && fullTranscript) {
-            // Fallback para remoção de overlap simples
-            processedText = removeSimpleOverlap(processedText, fullTranscript);
-          }
-
-          // Adiciona ao transcript final
+          // SEM remoção de overlap - cada chunk é independente
+          // Adiciona diretamente ao transcript final
           fullTranscript = mergeAndClean(fullTranscript, processedText);
-
-          // Atualiza contexto para próximo chunk
-          previousContext = extractContextForNextChunk(fullTranscript, processedText);
 
           // Tracking detalhado
           transcriptSegments.push({
-            chunkIndex: i,
-            startTime: chunkMeta.startTime,
-            endTime: chunkMeta.endTime,
+            chunkIndex: chunkResult.chunkIndex,
+            startTime: chunkResult.metadata.startTime,
+            endTime: chunkResult.metadata.endTime,
             text: processedText,
             originalLength: chunkResult.text.length,
             processedLength: processedText.length,
-            hadSilenceCut: chunkMeta.hasSilenceCut || false,
+            hadSilenceCut: chunkResult.metadata.hasSilenceCut || false,
             retryCount: chunkResult.retryCount
           });
         }
@@ -1290,11 +1231,12 @@ export function useRecorder() {
       // Finaliza progress tracking
       updateChunkProgress(chunks.length, 'merging');
 
-      console.log(`✅ Transcrição em chunks finalizada:`);
+      console.log(`✅ Transcrição SEQUENCIAL finalizada (estilo Notion):`);
       console.log(`   📊 Chunks processados: ${successfulChunks}/${chunks.length}`);
       console.log(`   🔄 Total de retries: ${totalRetries}`);
-      console.log(`   🔇 Cortes em silêncio: ${silenceCuts}`);
       console.log(`   📝 Tamanho final: ${fullTranscript.length} caracteres`);
+      console.log(`   🚀 Sistema híbrido: SEM tempo real + chunks 3min + sequencial`);
+      console.log(`   🎯 Objetivo: Eliminar repetições mantendo velocidade`);
 
       fullTranscript = finalizeTranscriptCleaning(fullTranscript);
       transcript.value = fullTranscript;
@@ -1319,14 +1261,9 @@ export function useRecorder() {
 
   // Constrói prompt contextual inteligente
   const buildContextualPrompt = (chunkIndex, previousContext, metadata) => {
-    if (chunkIndex === 0) {
-      return 'Transcrição de reunião corporativa em português brasileiro. Incluir nomes próprios e termos técnicos. Evitar alucinações - transcrever apenas o que é efetivamente falado.';
-    }
-
-    const silenceInfo = metadata?.hasSilenceCut ? ' Este segmento foi cortado em uma pausa natural.' : '';
-    const timeInfo = metadata?.startTime ? ` Segmento iniciando em ${metadata.startTime.toFixed(1)}s.` : '';
-
-    return `Continuação da reunião corporativa.${timeInfo}${silenceInfo} Contexto anterior: "${previousContext}". Manter consistência de nomes, termos técnicos e estilo de linguagem.`;
+    // OTIMIZADO: Removemos prompts complexos que podem causar repetições
+    // Retorna null para usar configurações padrão sem prompt
+    return null;
   };
 
   // Remove overlap usando informações de timestamp

@@ -146,38 +146,56 @@ export class OpenAITranscription {
         }
       }
 
-      const result = await response.json();
+      // Processa resposta baseada no formato solicitado
+      let result;
 
-      // Validação diferente baseada no formato de resposta
-      if (response_format === 'verbose_json') {
-        if (!result.text || !result.text.trim()) {
-          throw new Error('Transcrição vazia retornada pelo OpenAI (verbose_json)');
+      if (response_format === 'text') {
+        // Para formato 'text', a resposta é texto puro
+        result = await response.text();
+
+        if (!result || !result.trim()) {
+          throw new Error('Transcrição vazia retornada pelo OpenAI (text)');
         }
 
-        console.log('✅ Transcrição OpenAI concluída (verbose_json)');
-        console.log(`📝 Tamanho da transcrição: ${result.text.length} caracteres`);
-        console.log(`🕒 Duração detectada: ${result.duration?.toFixed(1)}s`);
-        console.log(`🎯 Segmentos: ${result.segments?.length || 0}`);
-        console.log(`💬 Palavras: ${result.words?.length || 0}`);
+        console.log('✅ Transcrição OpenAI concluída (text)');
+        console.log(`📝 Tamanho da transcrição: ${result.length} caracteres`);
 
-        // Retorna o objeto completo para verbose_json
-        return {
-          text: result.text.trim(),
-          language: result.language,
-          duration: result.duration,
-          segments: result.segments || [],
-          words: result.words || []
-        };
+        return result.trim();
+
       } else {
-        // Formato padrão (text ou json)
-        if (!result.text || !result.text.trim()) {
-          throw new Error('Transcrição vazia retornada pelo OpenAI');
+        // Para formatos JSON (json ou verbose_json)
+        result = await response.json();
+
+        if (response_format === 'verbose_json') {
+          if (!result.text || !result.text.trim()) {
+            throw new Error('Transcrição vazia retornada pelo OpenAI (verbose_json)');
+          }
+
+          console.log('✅ Transcrição OpenAI concluída (verbose_json)');
+          console.log(`📝 Tamanho da transcrição: ${result.text.length} caracteres`);
+          console.log(`🕒 Duração detectada: ${result.duration?.toFixed(1)}s`);
+          console.log(`🎯 Segmentos: ${result.segments?.length || 0}`);
+          console.log(`💬 Palavras: ${result.words?.length || 0}`);
+
+          // Retorna o objeto completo para verbose_json
+          return {
+            text: result.text.trim(),
+            language: result.language,
+            duration: result.duration,
+            segments: result.segments || [],
+            words: result.words || []
+          };
+        } else {
+          // Formato JSON padrão
+          if (!result.text || !result.text.trim()) {
+            throw new Error('Transcrição vazia retornada pelo OpenAI (json)');
+          }
+
+          console.log('✅ Transcrição OpenAI concluída (json)');
+          console.log(`📝 Tamanho da transcrição: ${result.text.length} caracteres`);
+
+          return result.text.trim();
         }
-
-        console.log('✅ Transcrição OpenAI concluída');
-        console.log(`📝 Tamanho da transcrição: ${result.text.length} caracteres`);
-
-        return result.text.trim();
       }
 
     } catch (error) {
