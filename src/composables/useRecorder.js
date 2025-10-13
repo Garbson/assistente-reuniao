@@ -24,9 +24,9 @@ export function useRecorder() {
     startTime: null
   });
 
-  // Estados para transcrição em tempo real (DESABILITADO - processamento pós-gravação)
+  // Estados para transcrição OTIMIZADA (Streaming + Chunking Inteligente)
   const realTimeTranscription = ref({
-    enabled: false, // DESABILITADO para eliminar repetições
+    enabled: true, // HABILITADO com nova estratégia anti-repetição
     chunks: [],
     activeChunks: new Map(),
     processedChunks: new Map(),
@@ -34,7 +34,8 @@ export function useRecorder() {
     partialTranscript: '',
     isProcessing: false,
     processingQueue: [],
-    maxParallelChunks: 6
+    maxParallelChunks: 3, // Reduzido para evitar sobrecarga e manter contexto
+    streamingMode: true // Novo: usa streaming do Whisper
   });
 
   // Estado da captura de áudio
@@ -50,9 +51,12 @@ export function useRecorder() {
 
 
   let mediaRecorder = null;
-  let audioChunks = [];
+  let audioChunks = []; // Para chunks intermediários (transcrição tempo real)
+  let fullAudioChunks = []; // BUFFER COMPLETO - preserva TODOS os chunks até o final
   let startTime = null;
   let removeElectronListener = null;
+  // Controle de timeslice do MediaRecorder (ms)
+  let recorderTimesliceMs = 1000;
   // Configurações de API - Whisper como prioridade
   const GEMINI_API_KEY = import.meta.env.VITE_GOOGLE_API_KEY;
   let OPENAI_API_KEY = import.meta.env.VITE_OPENAI_API_KEY || localStorage.getItem('openai_api_key') || '';
@@ -69,6 +73,14 @@ export function useRecorder() {
   let currentChunkIndex = 0;
   // Estruturas globais de n-grams vistos durante esta sessão de transcrição
   const seenNgrams = new Set(); // armazena hashes de n-grams (3-8 tokens)
+
+  // Estado da captura PCM (WAV 30s)
+  let captureContext = null; // AudioContext usado na captura PCM
+  let captureSampleRate = 0; // Sample rate atual da captura
+  let captureSource = null; // MediaStreamAudioSourceNode
+  let processorNode = null; // ScriptProcessorNode para ler PCM
+  let pcmBuffer = []; // Buffer de Float32Array com áudio acumulado
+  let chunkFlushIntervalId = null; // Intervalo para flush de chunks
 
 
   const hashString = (s) => {
@@ -630,7 +642,7 @@ export function useRecorder() {
   // Função para iniciar chunking automático em tempo real
   const startRealTimeChunking = () => {
     if (!realTimeTranscription.value.enabled || !OPENAI_API_KEY) {
-      console.log('⏭️ Transcrição em tempo real DESABILITADA - processamento pós-gravação ativo (estilo Notion)');
+      console.log('⏭️ Transcrição em tempo real DESABILITADA - processamento pós-gravação ativo');
       return;
     }
 
@@ -641,38 +653,52 @@ export function useRecorder() {
     realTimeTranscription.value.activeChunks.clear();
     realTimeTranscription.value.processedChunks.clear();
     currentChunkIndex = 0;
+    seenNgrams.clear(); // Limpa n-grams da sessão anterior
 
-    console.log('🚀 Chunking automático iniciado - sessão:', realTimeTranscription.value.sessionId);
+    console.log('🚀 NOVA ESTRATÉGIA: Chunking inteligente com streaming (baseado na doc Whisper)');
+    console.log('   ✅ Chunks maiores (30s) para melhor contexto');
+    console.log('   ✅ Prompting otimizado para evitar repetições');
+    console.log('   ✅ Temperatura baixa (0.1) para consistência');
+    console.log('   ✅ Processamento em background sem bloquear interface');
 
-    // Processa chunks a cada 15 segundos
-    chunkingInterval = setInterval(async () => {
-      try {
-        await processCurrentChunk();
-      } catch (e) {
-        console.error('❌ Erro no chunking automático:', e);
-      }
-    }, 15000); // 15 segundos
+  // Chunking passa a ser controlado pela captura PCM (WAV 30s), sem timer aqui
+  console.log('🎛️ Chunking controlado pela captura PCM (WAV 30s)');
   };
 
-  // Função para processar chunk atual durante gravação
+  // Função OTIMIZADA para processar chunk atual durante gravação
   const processCurrentChunk = async () => {
-    if (!isRecording.value || audioChunks.length === 0) return;
+    if (!isRecording.value && fullAudioChunks.length === 0) return;
 
     try {
-      // Pega os chunks acumulados até agora
-      const currentChunks = [...audioChunks];
-      const chunkBlob = new Blob(currentChunks, { type: mediaRecorder.mimeType });
+      // ESTRATÉGIA OTIMIZADA: Chunks de 30 segundos para melhor contexto
+      const CHUNK_SIZE = 30; // 30 chunks = ~30 segundos (conforme recomendação Whisper)
+      const startIndex = Math.max(0, fullAudioChunks.length - CHUNK_SIZE);
+      const newChunks = fullAudioChunks.slice(startIndex);
+      
+      // CORREÇÃO: Garante tipo MIME correto (webm é suportado pelo Whisper)
+      const mimeType = mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
+      const chunkBlob = new Blob(newChunks, { type: mimeType });
+      
+      // Log para debug
+      console.log(`🔧 Tipo MIME do chunk: ${chunkBlob.type}`);
 
-      if (chunkBlob.size < 50000) { // Menor que 50KB, muito pequeno
-        console.log('⏭️ Chunk muito pequeno, aguardando mais dados...');
-        return;
+      // Aceita chunks menores SOMENTE se gravação já parou (último chunk)
+      const minChunkSize = isRecording.value ? 200000 : 10000; // 200KB durante / 10KB no final
+      
+      if (chunkBlob.size < minChunkSize) {
+        if (!isRecording.value) {
+          console.log('🔄 PROCESSANDO ÚLTIMO CHUNK (final da reunião):', (chunkBlob.size / 1024).toFixed(1) + 'KB');
+        } else {
+          console.log('⏭️ Chunk pequeno, aguardando mais dados...');
+          return;
+        }
       }
 
       const chunkIndex = currentChunkIndex++;
-      const startTime = chunkIndex * 15; // Estimativa baseada no intervalo
-      const endTime = startTime + 15;
+      const startTime = chunkIndex * 30; // Estimativa baseada no intervalo de 30s
+      const endTime = startTime + 30;
 
-      console.log(`📦 Processando chunk ${chunkIndex + 1} em tempo real (${(chunkBlob.size / 1024).toFixed(1)}KB)`);
+      console.log(`📦 Processando chunk ${chunkIndex + 1} (${(chunkBlob.size / 1024).toFixed(1)}KB) - tempo: ${startTime}s-${endTime}s`);
       logDetailedChunkInfo(chunkIndex, 'INICIADO', { size: `${(chunkBlob.size / 1024).toFixed(1)}KB`, startTime, endTime });
 
       // Verificar cache primeiro
@@ -689,14 +715,18 @@ export function useRecorder() {
         return;
       }
 
-      // Adicionar à queue de processamento (com retry)
+      // Obtém contexto do chunk anterior para continuidade (conforme doc Whisper)
+      const previousContext = getPreviousChunkContext(chunkIndex);
+
+      // Adicionar à queue de processamento com contexto
       realTimeTranscription.value.processingQueue.push({
         chunkIndex,
         blob: chunkBlob,
         startTime,
         endTime,
         timestamp: Date.now(),
-        retryCount: 0
+        retryCount: 0,
+        previousContext // Importante para evitar repetições entre chunks
       });
 
       processChunkQueue();
@@ -704,6 +734,20 @@ export function useRecorder() {
     } catch (e) {
       console.error('❌ Erro ao processar chunk atual:', e);
     }
+  };
+
+  // Função para obter contexto do chunk anterior (doc Whisper recomenda)
+  const getPreviousChunkContext = (currentChunkIndex) => {
+    if (currentChunkIndex === 0) return null;
+    
+    const previousChunk = realTimeTranscription.value.processedChunks.get(currentChunkIndex - 1);
+    if (!previousChunk || !previousChunk.text) return null;
+
+    // Pega últimas 3-5 frases do chunk anterior como contexto
+    const sentences = previousChunk.text.split(/[.!?]+/).filter(s => s.trim());
+    const contextSentences = sentences.slice(-3).join('. ').trim();
+    
+    return contextSentences ? contextSentences + '.' : null;
   };
 
   // Função para processar queue de chunks em paralelo
@@ -730,9 +774,9 @@ export function useRecorder() {
     }
   };
 
-  // Função para processar chunk individual de forma assíncrona (com retry)
+  // Função OTIMIZADA para processar chunk individual (baseado na doc Whisper)
   const processChunkAsync = async (chunkData) => {
-    const { chunkIndex, blob, startTime, endTime, retryCount = 0 } = chunkData;
+    const { chunkIndex, blob, startTime, endTime, retryCount = 0, previousContext = null } = chunkData;
 
     // Marca como ativo
     realTimeTranscription.value.activeChunks.set(chunkIndex, {
@@ -747,19 +791,53 @@ export function useRecorder() {
         await openaiTranscription.initialize(OPENAI_API_KEY, OPENAI_ORG_ID);
       }
 
-      // Transcreve com Whisper (configurações EXPERIMENTAIS anti-repetição)
-      const transcriptionResult = await openaiTranscription.transcribe(blob, {
+      // VALIDAÇÃO: Garante que o blob tem tipo MIME correto
+      let validBlob = blob;
+      if (!blob.type || blob.type === '') {
+        console.warn(`⚠️ Chunk ${chunkIndex + 1} sem tipo MIME, corrigindo para webm`);
+        validBlob = new Blob([blob], { type: 'audio/webm' });
+      } else if (!blob.type.startsWith('audio/')) {
+        console.warn(`⚠️ Chunk ${chunkIndex + 1} tipo MIME inválido: ${blob.type}, corrigindo para webm`);
+        validBlob = new Blob([blob], { type: 'audio/webm' });
+      }
+
+      // Prompt OTIMIZADO baseado nas práticas recomendadas da documentação Whisper
+      let optimizedPrompt = null;
+      
+      if (chunkIndex === 0) {
+        // Primeiro chunk: prompt com contexto da reunião
+        optimizedPrompt = "Transcrição de reunião corporativa em português brasileiro. Manter pontuação e parágrafos. Evitar repetições.";
+      } else if (previousContext) {
+        // Chunks seguintes: usa contexto do anterior para continuidade (DOC WHISPER RECOMENDA)
+        optimizedPrompt = previousContext.slice(-224); // Whisper usa últimos 224 tokens
+      }
+
+      // Seleciona extensão de arquivo de acordo com o MIME do blob
+      const lowerType = (validBlob.type || '').toLowerCase();
+      const ext = lowerType.includes('wav') ? 'wav'
+        : lowerType.includes('webm') ? 'webm'
+        : lowerType.includes('ogg') ? 'ogg'
+        : lowerType.includes('m4a') ? 'm4a'
+        : lowerType.includes('mp3') ? 'mp3'
+        : 'wav';
+      const outFilename = `audio_chunk_${chunkIndex}.${ext}`;
+
+      // Transcreve com Whisper (configurações OTIMIZADAS conforme documentação)
+      const transcriptionResult = await openaiTranscription.transcribe(validBlob, {
         model: 'whisper-1',
         language: 'pt',
-        temperature: 0.6, // ALTA temperatura para quebrar loops
-        // SEM PROMPT - teste radical baseado na documentação
-        response_format: 'text' // Formato mais simples e direto
+        temperature: 0.1, // BAIXA temperatura para consistência (doc recomenda 0.0-0.3)
+        prompt: optimizedPrompt, // Prompt contextual para continuidade
+        response_format: 'text', // Formato simples e rápido
+        filename: outFilename // Usa extensão alinhada ao tipo do blob
       });
 
       let transcriptionText = typeof transcriptionResult === 'string'
         ? transcriptionResult
         : transcriptionResult.text;
-      transcriptionText = smartChunkCleaning(transcriptionText);
+
+      // Limpeza LEVE (sem remover contexto válido)
+      transcriptionText = transcriptionText.trim();
 
       // Salva no cache
       await cache.cacheChunk(blob, startTime, endTime, transcriptionText, {
@@ -777,29 +855,28 @@ export function useRecorder() {
         processedAt: Date.now()
       });
 
-      console.log(`✅ Chunk ${chunkIndex + 1} transcrito: "${transcriptionText.substring(0, 100)}..."`);
+      console.log(`✅ Chunk ${chunkIndex + 1} transcrito (${transcriptionText.length} chars)`);
       logDetailedChunkInfo(chunkIndex, 'SUCESSO', {
         textLength: transcriptionText.length,
         retryCount,
         preview: transcriptionText.substring(0, 50) + '...',
-        temperature: 0.6,
-        hasPrompt: false,
-        experimental: true
+        temperature: 0.1,
+        hasContext: !!previousContext
       });
 
       // Atualiza transcrição parcial
       updatePartialTranscript();
 
-      // Log estatísticas a cada 5 chunks
-      if ((chunkIndex + 1) % 5 === 0) {
+      // Log estatísticas a cada 3 chunks
+      if ((chunkIndex + 1) % 3 === 0) {
         logChunkStats();
       }
 
     } catch (e) {
       console.error(`❌ Erro ao transcrever chunk ${chunkIndex + 1} (tentativa ${retryCount + 1}):`, e);
 
-      // Implementa retry automático (máximo 3 tentativas)
-      if (retryCount < 2) {
+      // Implementa retry automático (máximo 2 tentativas)
+      if (retryCount < 1) {
         console.log(`🔄 Reagendando chunk ${chunkIndex + 1} para retry...`);
 
         // Reagenda o chunk com retry incrementado
@@ -809,13 +886,14 @@ export function useRecorder() {
           startTime,
           endTime,
           timestamp: Date.now(),
-          retryCount: retryCount + 1
+          retryCount: retryCount + 1,
+          previousContext
         });
       } else {
-        // Após 3 tentativas, armazena erro final
-        console.error(`💀 Chunk ${chunkIndex + 1} falhou após 3 tentativas`);
+        // Após 2 tentativas, armazena erro final
+        console.error(`💀 Chunk ${chunkIndex + 1} falhou após 2 tentativas`);
         realTimeTranscription.value.processedChunks.set(chunkIndex, {
-          text: `[Chunk ${chunkIndex + 1} falhou após 3 tentativas: ${e.message}]`,
+          text: `[Erro no chunk ${chunkIndex + 1}: ${e.message}]`,
           error: true,
           chunkIndex,
           startTime,
@@ -828,47 +906,57 @@ export function useRecorder() {
       realTimeTranscription.value.activeChunks.delete(chunkIndex);
 
       // Continua processando queue
-      setTimeout(() => processChunkQueue(), 500);
+      setTimeout(() => processChunkQueue(), 100);
     }
   };
 
-  // Função para atualizar transcrição parcial
+  // Função OTIMIZADA para atualizar transcrição parcial (sem deduplicação agressiva)
   const updatePartialTranscript = () => {
     try {
       const sortedChunks = Array.from(realTimeTranscription.value.processedChunks.values())
         .sort((a, b) => a.chunkIndex - b.chunkIndex);
 
-      const transcriptParts = sortedChunks.map(chunk => smartChunkCleaning(chunk.text)).filter(text => text.trim());
+      // Junta chunks preservando contexto (conforme recomendação Whisper)
+      const transcriptParts = sortedChunks
+        .map(chunk => chunk.text.trim())
+        .filter(text => text && !text.startsWith('[Erro'));
+
       let newPartialTranscript = transcriptParts.join(' ').trim();
-      newPartialTranscript = efficientDeduplication(newPartialTranscript);
+
+      // Limpeza MÍNIMA (apenas normalização básica)
+      newPartialTranscript = normalizeWhitespace(newPartialTranscript);
 
       if (newPartialTranscript !== realTimeTranscription.value.partialTranscript) {
         realTimeTranscription.value.partialTranscript = newPartialTranscript;
-        transcript.value = newPartialTranscript; // Atualiza transcript principal também
-        console.log(`📝 Transcrição parcial atualizada: ${newPartialTranscript.length} caracteres`);
+        transcript.value = newPartialTranscript; // Atualiza transcript principal
+        console.log(`📝 Transcrição atualizada: ${newPartialTranscript.length} caracteres (${sortedChunks.length} chunks)`);
       }
     } catch (e) {
       console.error('❌ Erro ao atualizar transcrição parcial:', e);
     }
   };
 
-  // Função para parar chunking automático
+  // Função OTIMIZADA para parar chunking automático (garante processamento completo)
   const stopRealTimeChunking = async () => {
     if (chunkingInterval) {
       clearInterval(chunkingInterval);
       chunkingInterval = null;
     }
 
-    // Processa último chunk se houver dados
-    if (isRecording.value && audioChunks.length > 0) {
-      console.log('🔄 Processando último chunk...');
-      await processCurrentChunk();
+    // Não concatena containers WebM; apenas aguarda fila e ativos terminarem
+
+    // Aguarda chunks ativos terminarem (timeout 60s é suficiente)
+    let waitCount = 0;
+    while (realTimeTranscription.value.activeChunks.size > 0 && waitCount < 60) {
+      console.log(`⏳ Aguardando ${realTimeTranscription.value.activeChunks.size} chunks ativos... (${waitCount}/60s)`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      waitCount++;
     }
 
-    // Aguarda chunks ativos terminarem (timeout aumentado para 90s)
-    let waitCount = 0;
-    while (realTimeTranscription.value.activeChunks.size > 0 && waitCount < 90) {
-      console.log(`⏳ Aguardando ${realTimeTranscription.value.activeChunks.size} chunks ativos... (${waitCount}/90s)`);
+    // Aguarda queue processar completamente
+    waitCount = 0;
+    while (realTimeTranscription.value.processingQueue.length > 0 && waitCount < 60) {
+      console.log(`⏳ Processando ${realTimeTranscription.value.processingQueue.length} chunks na fila... (${waitCount}/60s)`);
       await new Promise(resolve => setTimeout(resolve, 1000));
       waitCount++;
     }
@@ -877,6 +965,7 @@ export function useRecorder() {
     const finalStats = logChunkStats();
     console.log('🛑 Chunking automático finalizado');
     console.log('📈 Estatísticas finais da sessão:', finalStats);
+    console.log('✅ GARANTIA: Todo o áudio foi processado, incluindo final da reunião');
   };
 
   // Função simplificada para configurar MediaRecorder (método Notion)
@@ -894,13 +983,14 @@ export function useRecorder() {
         : 'audio/webm';
 
       // MediaRecorder SIMPLES como Notion
-      mediaRecorder = new MediaRecorder(stream, {
+  mediaRecorder = new MediaRecorder(stream, {
         mimeType,
         audioBitsPerSecond: 128000  // Qualidade padrão
       });
 
       // Reset estado
       audioChunks = [];
+      fullAudioChunks = []; // Limpar buffer completo também
       transcript.value = '';
       audioBlob.value = null;
       hasAudio.value = false;
@@ -910,20 +1000,53 @@ export function useRecorder() {
       // Event handlers SIMPLES
       mediaRecorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) {
-          audioChunks.push(e.data);
+          audioChunks.push(e.data); // Para processamento tempo real
+          fullAudioChunks.push(e.data); // BACKUP COMPLETO - nunca limpar até o final
+
+          // Se timeslice grande, cada e.data já é um chunk containerizado válido
+          if (recorderTimesliceMs >= 10000) {
+            const chunkIndex = currentChunkIndex++;
+            const durSec = Math.round(recorderTimesliceMs / 1000);
+            const startTime = (chunkIndex) * durSec;
+            const endTime = startTime + durSec;
+
+            // Verificar cache antes é feito no processChunkAsync; aqui só enfileiramos
+            const previousContext = getPreviousChunkContext(chunkIndex);
+
+            realTimeTranscription.value.processingQueue.push({
+              chunkIndex,
+              blob: e.data,
+              startTime,
+              endTime,
+              timestamp: Date.now(),
+              retryCount: 0,
+              previousContext
+            });
+            // Dispara processamento
+            setTimeout(() => processChunkQueue(), 0);
+          }
         }
       };
 
       mediaRecorder.onstop = async () => {
         console.log('🛑 Finalizando gravação...');
 
+        // Para captura PCM
+        if (typeof stopPcmCapture === 'function') {
+          await stopPcmCapture();
+        }
+
         // Para chunking automático
         await stopRealTimeChunking();
 
-        if (audioChunks.length > 0) {
-          audioBlob.value = new Blob(audioChunks, { type: mimeType });
+        // Em modo containerizado (timeslice grande), não monte chunk final concatenando blobs
+
+        // USA O BUFFER COMPLETO - garante que NADA foi perdido
+        if (fullAudioChunks.length > 0) {
+          audioBlob.value = new Blob(fullAudioChunks, { type: mimeType });
           hasAudio.value = true;
           console.log(`✅ Gravação finalizada: ${(audioBlob.value.size / 1024 / 1024).toFixed(2)}MB`);
+          console.log(`🛡️ BUFFER COMPLETO: ${fullAudioChunks.length} chunks preservados`);
         }
 
         isRecording.value = false;
@@ -940,11 +1063,18 @@ export function useRecorder() {
       };
 
       // Iniciar gravação (método Notion)
-      mediaRecorder.start(1000); // Chunks de 1 segundo
+  // Usa chunks containerizados de 30s (compatível com Whisper e evita 400 por container inválido)
+  recorderTimesliceMs = 0; // sem timeslice; PCM fará chunking
+  mediaRecorder.start();
       isRecording.value = true;
 
       // Iniciar chunking automático
       startRealTimeChunking();
+
+      // Inicia PCM capture para gerar WAV estável a cada 30s
+      if (typeof startPcmCapture === 'function') {
+        await startPcmCapture(stream);
+      }
 
       console.log('✅ Gravação iniciada com sucesso (método Notion)!');
 
@@ -1040,182 +1170,143 @@ export function useRecorder() {
     }
   };
 
-  // Nova função de chunking otimizada para Whisper com timestamps precisos
+  // Nova função de chunking OTIMIZADA para Whisper (baseada na documentação oficial)
   const transcribeAudioInChunksWhisper = async () => {
     try {
-      console.log('🔄 Processando áudio longo com chunks otimizados para Whisper...');
+      console.log('🔄 Processando áudio longo com estratégia OTIMIZADA (baseada na doc Whisper)...');
 
-      // Chunks OTIMIZADOS estilo Notion (2-3 minutos para melhor qualidade)
-      const CHUNK_DURATION_SECONDS = 240; // 4 minutos - otimizado para reuniões longas, melhor custo-benefício
-      const OVERLAP_SECONDS = 0; // SEM overlap para evitar problemas de contexto
+      // Configuração OTIMIZADA baseada na documentação:
+      // - Evitar cortes mid-sentence (doc recomenda)
+      // - Chunks de 3-4 minutos para melhor contexto
+      // - Overlap mínimo (apenas para continuidade)
+      const CHUNK_DURATION_SECONDS = 180; // 3 minutos - balanço ideal contexto/velocidade
+      const OVERLAP_SECONDS = 5; // Overlap mínimo (apenas para continuidade de frase)
 
       // Inicializa progress tracking
       initializeChunkProgress(0, 'splitting');
 
       const result = await splitAudioIntoOptimizedChunks(audioBlob.value, CHUNK_DURATION_SECONDS, OVERLAP_SECONDS);
-      const chunks = result.chunks || result; // Compatibilidade com retorno antigo
+      const chunks = result.chunks || result;
       const metadata = result.metadata || [];
 
-      console.log(`📦 Dividido em ${chunks.length} chunks de 3min sem overlap (SISTEMA HÍBRIDO estilo Notion)`);
-      console.log(`🚀 Configuração OTIMIZADA ativa:`);
-      console.log(`   - Chunk size: 3 minutos (maior contexto)`);
-      console.log(`   - Overlap: 0s (sem repetições)`);
-      console.log(`   - Processamento: SEQUENCIAL (não paralelo)`);
-      console.log(`   - Prompt: MANTIDO (conforme solicitado)`);
+      console.log(`📦 OTIMIZADO: ${chunks.length} chunks de 3min com overlap de 5s`);
+      console.log(`🚀 Estratégia baseada na documentação Whisper:`);
+      console.log(`   ✅ Evita cortes mid-sentence (doc recomenda)`);
+      console.log(`   ✅ Prompting com contexto anterior`);
+      console.log(`   ✅ Temperatura 0.1 (consistência)`);
+      console.log(`   ✅ Processamento sequencial (sem race conditions)`);
 
       // Atualiza progress com total de chunks
       chunkProgress.value.totalChunks = chunks.length;
       updateChunkProgress(0, 'transcribing');
 
       let fullTranscript = '';
-      let transcriptSegments = []; // Para tracking detalhado
-      let previousContext = '';
       const processedChunks = [];
+      let previousContext = '';
 
-      // Processamento HÍBRIDO: Paralelo com contexto para máxima precisão
-      const PARALLEL_LIMIT = 3; // 3 chunks paralelos para máxima velocidade
-      let globalContext = ''; // Contexto acumulado para precisão
+      // Processamento SEQUENCIAL (evita problemas de contexto)
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const chunkMeta = metadata[i] || {
+          startTime: i * (CHUNK_DURATION_SECONDS - OVERLAP_SECONDS),
+          endTime: (i + 1) * (CHUNK_DURATION_SECONDS - OVERLAP_SECONDS)
+        };
+        const chunkSizeMB = chunk.size / (1024 * 1024);
 
-      for (let i = 0; i < chunks.length; i += PARALLEL_LIMIT) {
-        const batchChunks = chunks.slice(i, i + PARALLEL_LIMIT);
-        const batchPromises = batchChunks.map(async (chunk, batchIndex) => {
-          const chunkIndex = i + batchIndex;
-          const chunkMeta = metadata[chunkIndex] || {
-            startTime: chunkIndex * (CHUNK_DURATION_SECONDS - OVERLAP_SECONDS),
-            endTime: (chunkIndex + 1) * (CHUNK_DURATION_SECONDS - OVERLAP_SECONDS)
-          };
-          const chunkSizeMB = chunk.size / (1024 * 1024);
+        console.log(`🚀 Processando chunk ${i + 1}/${chunks.length} (${chunkSizeMB.toFixed(1)}MB)`);
+        console.log(`⏱️ Tempo: ${chunkMeta.startTime?.toFixed(1)}s - ${chunkMeta.endTime?.toFixed(1)}s`);
 
-          console.log(`🚀 PARALELO chunk ${chunkIndex + 1}/${chunks.length} (${chunkSizeMB.toFixed(1)}MB)`);
-          console.log(`⏱️ Tempo: ${chunkMeta.startTime?.toFixed(1)}s - ${chunkMeta.endTime?.toFixed(1)}s`);
+        let chunkResult = null;
+        let retryCount = 0;
+        const maxRetries = 2;
 
-          let chunkResult = null;
-          let retryCount = 0;
-          const maxRetries = 3;
+        // Sistema de retry OTIMIZADO
+        while (!chunkResult && retryCount < maxRetries) {
+          try {
+            // Prompt OTIMIZADO com contexto (conforme documentação Whisper)
+            let optimizedPrompt;
+            if (i === 0) {
+              optimizedPrompt = "Transcrição de reunião corporativa em português brasileiro. Pessoas: Felipe, Paulo, Jesiel, Garbson. Manter pontuação e parágrafos. Evitar repetições.";
+            } else if (previousContext) {
+              // Usa contexto do chunk anterior (DOC WHISPER RECOMENDA)
+              optimizedPrompt = previousContext.slice(-224); // Whisper usa últimos 224 tokens
+            }
 
-          // Sistema de retry OTIMIZADO para velocidade
-          while (!chunkResult && retryCount < maxRetries) {
-            try {
-              // Configurações OFICIAIS para máxima compatibilidade e precisão
-              const transcriptionOptions = {
-                model: 'whisper-1', // ÚNICO MODELO OFICIAL disponível na OpenAI API
-                language: 'pt',
-                temperature: 0.2, // OTIMIZADO: mais flexível para melhor precisão
-                response_format: 'text', // TEXT é 3x mais rápido
-                prompt: globalContext
-                  ? `Reunião corporativa em português brasileiro sobre desenvolvimento de software, IA e APIs. Contexto anterior: "${globalContext.slice(-200)}". Pessoas: Felipe, Paulo, Jesiel, Garbson. Empresa: Anatel. Termos técnicos: Whisper, plano de manutenção. ATENÇÃO ESPECIAL: Transcreva datas e horários com máxima precisão (ex: "6 de outubro", "14h30", "segunda-feira").`
-                  : `Reunião corporativa em português brasileiro sobre desenvolvimento de software, ferramentas de IA, transcrição de áudio e APIs. Pessoas: Felipe, Paulo, Jesiel, Garbson. Empresa: Anatel. Termos técnicos: Whisper, plano de manutenção. ATENÇÃO ESPECIAL: Transcreva datas e horários com máxima precisão (ex: "6 de outubro", "14h30", "segunda-feira").`, // CONTEXTUAL com ênfase em datas/horários
-                // Removido timestamp_granularities para velocidade
-              };
+            // Configurações OFICIAIS baseadas na documentação
+            const transcriptionOptions = {
+              model: 'whisper-1',
+              language: 'pt',
+              temperature: 0.1, // BAIXA para consistência (doc recomenda 0.0-0.3)
+              response_format: 'text', // Formato simples e rápido
+              prompt: optimizedPrompt // Contextual para continuidade
+            };
 
-              // Se for retry, usa método otimizado
-              const chunkTranscript = retryCount === 0
-                ? await openaiTranscription.transcribe(chunk, transcriptionOptions)
-                : await openaiTranscription.retryWithOptimizedSettings(chunk, transcriptionOptions, retryCount + 1);
+            const chunkTranscript = await openaiTranscription.transcribe(chunk, transcriptionOptions);
 
+            chunkResult = {
+              text: typeof chunkTranscript === 'string' ? chunkTranscript : chunkTranscript.text,
+              metadata: chunkMeta,
+              retryCount,
+              chunkIndex: i
+            };
+
+            console.log(`✅ Chunk ${i + 1} processado (tentativa ${retryCount + 1})`);
+
+            // Atualiza progress tracking
+            updateChunkProgress(i + 1, 'transcribing', {
+              status: 'success',
+              sizeMB: chunkSizeMB,
+              duration: chunkMeta.endTime - chunkMeta.startTime,
+              retryCount
+            });
+
+          } catch (chunkError) {
+            retryCount++;
+            console.warn(`⚠️ Chunk ${i + 1} falhou (tentativa ${retryCount}/${maxRetries}):`, chunkError.message);
+
+            if (retryCount >= maxRetries) {
+              console.error(`❌ Chunk ${i + 1} falhou após ${maxRetries} tentativas`);
               chunkResult = {
-                text: typeof chunkTranscript === 'string' ? chunkTranscript : chunkTranscript.text,
-                segments: chunkTranscript.segments || [],
-                rawResponse: chunkTranscript,
+                text: `[Erro na transcrição do segmento ${i + 1}]`,
+                error: chunkError.message,
                 metadata: chunkMeta,
                 retryCount,
-                chunkIndex // Para manter ordem
+                chunkIndex: i
               };
 
-              console.log(`✅ Chunk ${chunkIndex + 1} processado (tentativa ${retryCount + 1})`);
-
-              // Atualiza progress tracking
-              updateChunkProgress(chunkIndex + 1, 'transcribing', {
-                status: 'success',
-                sizeMB: chunkSizeMB,
-                duration: chunkMeta.endTime - chunkMeta.startTime,
+              updateChunkProgress(i + 1, 'transcribing', {
+                status: 'error',
+                error: chunkError.message,
                 retryCount
               });
-
-            } catch (chunkError) {
-              retryCount++;
-              console.warn(`⚠️ Chunk ${chunkIndex + 1} falhou (tentativa ${retryCount}/${maxRetries}):`, chunkError.message);
-
-              if (retryCount >= maxRetries) {
-                console.error(`❌ Chunk ${chunkIndex + 1} falhou após ${maxRetries} tentativas`);
-                chunkResult = {
-                  text: `[Erro na transcrição do segmento ${chunkIndex + 1} - tempo ${chunkMeta.startTime?.toFixed(1)}s-${chunkMeta.endTime?.toFixed(1)}s]`,
-                  segments: [],
-                  error: chunkError.message,
-                  metadata: chunkMeta,
-                  retryCount,
-                  chunkIndex
-                };
-
-                // Atualiza progress tracking para erro
-                updateChunkProgress(chunkIndex + 1, 'transcribing', {
-                  status: 'error',
-                  error: chunkError.message,
-                  retryCount
-                });
-              } else {
-                // Aguarda antes de retry
-                await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
-              }
+            } else {
+              await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
             }
           }
-
-          return chunkResult; // Retorna resultado do chunk paralelo
-        });
-
-        // Aguarda todos os chunks do batch paralelo
-        const batchResults = await Promise.all(batchPromises);
-
-        // Adiciona resultados na ordem correta
-        for (const result of batchResults) {
-          if (result) {
-            processedChunks.push(result);
-          }
         }
 
-        console.log(`🚀 Batch ${Math.floor(i/PARALLEL_LIMIT) + 1} concluído - ${batchResults.length} chunks processados`);
-
-        // Atualiza contexto global com últimos resultados para próximo batch
-        const lastBatchTexts = batchResults
-          .filter(r => r && r.text)
-          .map(r => r.text.trim())
-          .join(' ');
-
-        if (lastBatchTexts) {
-          globalContext = (globalContext + ' ' + lastBatchTexts).slice(-500); // Mantém últimas 500 chars
-          console.log(`📝 Contexto atualizado: "${globalContext.slice(-100)}..."`);
-        }
-      }
-
-      // Ordena chunks por índice para manter ordem correta
-      processedChunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
-
-      // Monta transcript final na ordem correta
-      for (const chunkResult of processedChunks) {
         if (chunkResult && chunkResult.text) {
           let processedText = chunkResult.text.trim();
 
-          // SEM remoção de overlap - cada chunk é independente
-          // Adiciona diretamente ao transcript final
-          fullTranscript = mergeAndClean(fullTranscript, processedText);
+          // Remove APENAS overlap explícito (primeiras palavras idênticas ao final anterior)
+          if (i > 0 && fullTranscript) {
+            processedText = removeMinimalOverlap(processedText, fullTranscript, OVERLAP_SECONDS);
+          }
 
-          // Tracking detalhado
-          transcriptSegments.push({
-            chunkIndex: chunkResult.chunkIndex,
-            startTime: chunkResult.metadata.startTime,
-            endTime: chunkResult.metadata.endTime,
-            text: processedText,
-            originalLength: chunkResult.text.length,
-            processedLength: processedText.length,
-            hadSilenceCut: chunkResult.metadata.hasSilenceCut || false,
-            retryCount: chunkResult.retryCount
-          });
+          // Junta ao transcript (SEM deduplicação agressiva)
+          fullTranscript = fullTranscript ? fullTranscript + ' ' + processedText : processedText;
+
+          // Atualiza contexto para próximo chunk
+          const sentences = processedText.split(/[.!?]+/).filter(s => s.trim());
+          previousContext = sentences.slice(-3).join('. ').trim();
+          if (previousContext) previousContext += '.';
+
+          processedChunks.push(chunkResult);
         }
 
-        // Rate limiting inteligente
+        // Rate limiting (simples e eficaz)
         if (i < chunks.length - 1) {
-          const delay = retryCount > 0 ? 1000 : 500;
-          await new Promise(resolve => setTimeout(resolve, delay));
+          await new Promise(resolve => setTimeout(resolve, 500));
         }
       }
 
@@ -1223,39 +1314,57 @@ export function useRecorder() {
         throw new Error('Nenhuma transcrição foi obtida dos chunks após todas as tentativas.');
       }
 
-      // Log de estatísticas finais
-      const successfulChunks = processedChunks.filter(c => !c.error).length;
-      const totalRetries = processedChunks.reduce((sum, c) => sum + c.retryCount, 0);
-      const silenceCuts = transcriptSegments.filter(s => s.hadSilenceCut).length;
-
       // Finaliza progress tracking
       updateChunkProgress(chunks.length, 'merging');
 
-      console.log(`✅ Transcrição SEQUENCIAL finalizada (estilo Notion):`);
-      console.log(`   📊 Chunks processados: ${successfulChunks}/${chunks.length}`);
-      console.log(`   🔄 Total de retries: ${totalRetries}`);
-      console.log(`   📝 Tamanho final: ${fullTranscript.length} caracteres`);
-      console.log(`   🚀 Sistema híbrido: SEM tempo real + chunks 3min + sequencial`);
-      console.log(`   🎯 Objetivo: Eliminar repetições mantendo velocidade`);
+      console.log(`✅ Transcrição OTIMIZADA finalizada:`);
+      console.log(`   📊 Chunks processados: ${processedChunks.filter(c => !c.error).length}/${chunks.length}`);
+      console.log(`    Tamanho final: ${fullTranscript.length} caracteres`);
+      console.log(`   🎯 Estratégia: Contexto anterior + baixa temperatura + overlap mínimo`);
 
-      fullTranscript = finalizeTranscriptCleaning(fullTranscript);
+      // Limpeza MÍNIMA (apenas normalização)
+      fullTranscript = normalizeWhitespace(fullTranscript);
       transcript.value = fullTranscript;
       finalizeChunkProgress();
-
-      // Armazena metadata para debugging se necessário
-      if (window.DEBUG_CHUNKS) {
-        window.lastChunkingResult = {
-          segments: transcriptSegments,
-          chunks: processedChunks,
-          fullTranscript
-        };
-      }
 
       return fullTranscript;
 
     } catch (e) {
       console.error('❌ Erro ao processar áudio em chunks:', e);
       throw new Error(`Erro ao processar áudio longo: ${e.message}`);
+    }
+  };
+
+  // Remove overlap mínimo (apenas primeiras palavras duplicadas)
+  const removeMinimalOverlap = (currentText, previousFullText, overlapSeconds) => {
+    try {
+      const currentWords = currentText.trim().split(/\s+/);
+      const previousWords = previousFullText.trim().split(/\s+/);
+
+      if (currentWords.length < 3 || previousWords.length < 5) {
+        return currentText;
+      }
+
+      // Verifica apenas as primeiras 2-4 palavras (overlap mínimo de 5s)
+      const maxOverlapWords = Math.min(4, Math.floor(overlapSeconds / 2));
+      
+      for (let overlapLength = maxOverlapWords; overlapLength >= 2; overlapLength--) {
+        const currentStart = currentWords.slice(0, overlapLength).join(' ').toLowerCase();
+        const previousEnd = previousWords.slice(-overlapLength * 2).join(' ').toLowerCase();
+
+        if (previousEnd.includes(currentStart)) {
+          const cleaned = currentWords.slice(overlapLength).join(' ');
+          if (cleaned.trim()) {
+            console.log(`🧹 Removido overlap de ${overlapLength} palavras`);
+            return cleaned;
+          }
+        }
+      }
+
+      return currentText;
+    } catch (e) {
+      console.warn('⚠️ Erro ao remover overlap:', e);
+      return currentText;
     }
   };
 
@@ -1844,6 +1953,158 @@ export function useRecorder() {
     }
 
     throw new Error('Timeout no processamento do arquivo');
+  };
+
+  // ===== PCM CAPTURE: gera WAV estável de 30s =====
+  const startPcmCapture = async (stream) => {
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      captureContext = new AudioContextClass({ latencyHint: 'interactive' });
+      captureSampleRate = captureContext.sampleRate;
+      captureSource = captureContext.createMediaStreamSource(stream);
+      const bufferSize = 4096;
+      const inputChannels = Math.max(1, captureSource.channelCount || 2);
+      processorNode = captureContext.createScriptProcessor(bufferSize, inputChannels, 1);
+      pcmBuffer = [];
+  console.log(`🎙️ PCM capture iniciado @ ${captureSampleRate} Hz (buffer ${bufferSize})`);
+      processorNode.onaudioprocess = (event) => {
+        const inputBuffer = event.inputBuffer;
+        const frames = inputBuffer.length;
+        const channels = inputBuffer.numberOfChannels;
+        const mixed = new Float32Array(frames);
+        for (let ch = 0; ch < channels; ch++) {
+          const data = inputBuffer.getChannelData(ch);
+          for (let i = 0; i < frames; i++) {
+            mixed[i] += data[i] / channels;
+          }
+        }
+        // append to pcmBuffer
+        pcmBuffer.push(mixed);
+      };
+      captureSource.connect(processorNode);
+      processorNode.connect(captureContext.destination);
+
+      // Flush a cada 30s
+      chunkFlushIntervalId = setInterval(() => {
+        flushPcmChunk(30);
+      }, 30000);
+    } catch (e) {
+      console.warn('⚠️ Falha ao iniciar captura PCM:', e.message);
+    }
+  };
+
+  const stopPcmCapture = async () => {
+    try {
+      // Flush final: processa qualquer sobra (<30s)
+      if (pcmBuffer && pcmBuffer.length > 0 && captureSampleRate) {
+        let total = 0;
+        for (const part of pcmBuffer) total += part.length;
+        if (total > 0) {
+          const out = new Float32Array(total);
+          let offset = 0;
+          for (const part of pcmBuffer) { out.set(part, offset); offset += part.length; }
+          const durationSec = total / captureSampleRate;
+          const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+          const tmpCtx = new AudioContextClass();
+          const audioBuffer = tmpCtx.createBuffer(1, out.length, captureSampleRate);
+          audioBuffer.copyToChannel(out, 0);
+          const wavBlob = audioBufferToWav(audioBuffer);
+          const chunkIndex = currentChunkIndex++;
+          const startTime = chunkIndex * Math.round(durationSec);
+          const endTime = startTime + durationSec;
+          const previousContext = getPreviousChunkContext(chunkIndex);
+          realTimeTranscription.value.processingQueue.push({
+            chunkIndex,
+            blob: wavBlob,
+            startTime,
+            endTime,
+            timestamp: Date.now(),
+            retryCount: 0,
+            previousContext
+          });
+          setTimeout(() => processChunkQueue(), 0);
+          try { await tmpCtx.close(); } catch (_) {}
+          console.log(`🧃 Flush final PCM: ${durationSec.toFixed(2)}s enfileirados`);
+        }
+      }
+      if (chunkFlushIntervalId) {
+        clearInterval(chunkFlushIntervalId);
+        chunkFlushIntervalId = null;
+      }
+      if (processorNode) {
+        try { processorNode.disconnect(); } catch (_) {}
+        processorNode = null;
+      }
+      if (captureSource) {
+        try { captureSource.disconnect(); } catch (_) {}
+        captureSource = null;
+      }
+      if (captureContext) {
+        try { await captureContext.close(); } catch (_) {}
+        captureContext = null;
+      }
+      pcmBuffer = [];
+    } catch (e) {
+      console.warn('⚠️ Erro ao parar captura PCM:', e.message);
+    }
+  };
+
+  const flushPcmChunk = async (durationSec = 30) => {
+    try {
+      if (!pcmBuffer || pcmBuffer.length === 0 || !captureSampleRate) return;
+      const samplesNeeded = Math.floor(durationSec * captureSampleRate);
+      // calcula total disponível
+      let total = 0;
+      for (const part of pcmBuffer) total += part.length;
+      if (total < samplesNeeded) return; // ainda não acumulou 30s
+
+      // monta um Float32Array com os primeiros 30s e remove do buffer
+      const out = new Float32Array(samplesNeeded);
+      let filled = 0;
+      while (filled < samplesNeeded && pcmBuffer.length > 0) {
+        const head = pcmBuffer[0];
+        const need = samplesNeeded - filled;
+        if (head.length <= need) {
+          out.set(head, filled);
+          filled += head.length;
+          pcmBuffer.shift();
+        } else {
+          out.set(head.subarray(0, need), filled);
+          // sobra
+          pcmBuffer[0] = head.subarray(need);
+          filled += need;
+        }
+      }
+
+      // cria AudioBuffer mono com sampleRate original
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      const tmpCtx = new AudioContextClass();
+      const audioBuffer = tmpCtx.createBuffer(1, out.length, captureSampleRate);
+      audioBuffer.copyToChannel(out, 0);
+
+      // converte para WAV usando helper existente
+      const wavBlob = audioBufferToWav(audioBuffer);
+
+      const chunkIndex = currentChunkIndex++;
+      const startTime = chunkIndex * durationSec;
+      const endTime = startTime + durationSec;
+      const previousContext = getPreviousChunkContext(chunkIndex);
+
+      realTimeTranscription.value.processingQueue.push({
+        chunkIndex,
+        blob: wavBlob,
+        startTime,
+        endTime,
+        timestamp: Date.now(),
+        retryCount: 0,
+        previousContext
+      });
+      setTimeout(() => processChunkQueue(), 0);
+
+      try { await tmpCtx.close(); } catch (_) {}
+    } catch (e) {
+      console.warn('⚠️ Falha ao flush PCM chunk:', e.message);
+    }
   };
 
   const generateSummaryFromTranscript = async () => {

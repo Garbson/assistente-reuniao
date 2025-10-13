@@ -560,7 +560,7 @@
                 {{ meeting.transcript.length }} caracteres
               </span>
               <button
-                @click="copyTranscript"
+                @click="(e) => copyTranscript(e)"
                 class="text-sm text-blue-600 hover:text-blue-800 font-medium"
                 title="Copiar transcrição"
               >

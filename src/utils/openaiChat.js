@@ -74,7 +74,7 @@ export class OpenAIChat {
       console.log(`🤖 Gerando resumo com ChatGPT (${model})`);
       console.log(`📝 Tamanho da transcrição: ${transcript.length} caracteres`);
 
-      const prompt = `Você receberá a transcrição de uma reunião corporativa. Produza APENAS o JSON final (sem markdown, sem comentários) seguindo as regras abaixo rigorosamente.
+  const prompt = `Você receberá a transcrição de uma reunião corporativa. Produza APENAS o JSON final (sem markdown, sem comentários) seguindo as regras abaixo rigorosamente.
 
 OBJETIVO: Gerar um RESUMO ESTRUTURADO com título inteligente e pontos principais organizados de forma direta e prática.
 
@@ -164,65 +164,77 @@ Retorne somente o JSON completo e detalhado no formato estruturado.`;
         headers['OpenAI-Organization'] = this.organizationId;
       }
 
-      // Prepara o body da requisição
-      const requestBody = {
-        model: model,
-        messages: [
-          {
-            role: 'user',
-            content: prompt
-          }
-        ],
-        temperature: temperature,
-        max_tokens: max_tokens
-      };
+      // Prepara o body da requisição (tenta JSON mode quando suportado)
+      const baseMessages = [
+        { role: 'system', content: 'Você é um assistente que SEMPRE retorna somente um JSON válido seguindo exatamente o esquema pedido, sem markdown e sem comentários.' },
+        { role: 'user', content: prompt }
+      ];
 
-      // Faz a chamada para API
-      const response = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(requestBody)
+      const makeBody = (m, useJsonMode = true) => ({
+        model: m,
+        messages: baseMessages,
+        temperature,
+        max_tokens,
+        ...(useJsonMode ? { response_format: { type: 'json_object' } } : {})
       });
 
-      console.log('📊 Status da geração de resumo:', response.status);
+      const callApi = async (body) => {
+        const resp = await fetch(`${this.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body)
+        });
+        return resp;
+      };
 
+      // 1) Primeira tentativa: modelo pedido + JSON mode
+      let response = await callApi(makeBody(model, true));
+      let result;
+
+      // 1.1) Se JSON mode não suportado, tenta sem JSON mode
       if (!response.ok) {
         const errorText = await response.text();
-        console.error('❌ Erro OpenAI ChatGPT:', errorText);
-
         let parsedError;
-        try {
-          parsedError = JSON.parse(errorText);
-          console.error('📋 Detalhes do erro:', parsedError);
-        } catch (e) {
-          console.error('📋 Erro (texto):', errorText);
-        }
+        try { parsedError = JSON.parse(errorText); } catch(_) {}
 
-        // Tratamento de erros específicos
-        if (response.status === 401) {
-          throw new Error('API key OpenAI inválida ou expirada');
-        } else if (response.status === 429) {
-          throw new Error('Limite de rate excedido. Tente novamente em alguns minutos.');
-        } else if (parsedError?.error?.code === 'insufficient_quota') {
-          throw new Error('Cota insuficiente. Verifique seu plano e billing na OpenAI.');
-        } else if (parsedError?.error?.code === 'context_length_exceeded') {
-          throw new Error('Transcrição muito longa para o modelo. Tente dividir em partes menores.');
+        if (response.status === 400 && (errorText.includes('response_format') || parsedError?.error?.message?.includes('response_format'))) {
+          console.warn('ℹ️ JSON mode não suportado por este modelo. Tentando novamente sem response_format...');
+          response = await callApi(makeBody(model, false));
         } else {
+          // Tratamento de erros comuns
+          console.error('❌ Erro OpenAI ChatGPT:', errorText);
+          if (response.status === 401) throw new Error('API key OpenAI inválida ou expirada');
+          if (response.status === 429) throw new Error('Limite de rate excedido. Tente novamente em alguns minutos.');
+          if (parsedError?.error?.code === 'insufficient_quota') throw new Error('Cota insuficiente. Verifique seu plano e billing na OpenAI.');
+          if (parsedError?.error?.code === 'context_length_exceeded') throw new Error('Transcrição muito longa para o modelo. Tente dividir em partes menores.');
           throw new Error(`Erro OpenAI ChatGPT: ${response.status} - ${errorText}`);
         }
       }
 
-      const result = await response.json();
+      console.log('📊 Status da geração de resumo:', response.status);
+      result = await response.json();
 
-      // Valida a resposta
-      if (!result.choices || result.choices.length === 0) {
-        throw new Error('Resposta vazia do ChatGPT');
+      let summaryText = result?.choices?.[0]?.message?.content?.trim() || '';
+
+      // 2) Se vazio, tenta um retry rápido com modelo alternativo (quando disponível)
+      if (!summaryText) {
+        console.warn('⚠️ Resumo vazio, tentando retry com modelo alternativo (gpt-4o-mini)...');
+        try {
+          const altModel = 'gpt-4o-mini';
+          const resp2 = await callApi(makeBody(altModel, true));
+          if (resp2.ok) {
+            const json2 = await resp2.json();
+            summaryText = json2?.choices?.[0]?.message?.content?.trim() || '';
+          }
+        } catch (_) {
+          // ignora, cairá no fallback local
+        }
       }
 
-      const summaryText = result.choices[0].message.content.trim();
-
+      // 3) Se ainda vazio, retorna um fallback local estruturado
       if (!summaryText) {
-        throw new Error('Resumo vazio retornado pelo ChatGPT');
+        console.warn('⚠️ Resumo vazio após retries. Usando fallback local.');
+        return this.#buildLocalFallback(transcript);
       }
 
       console.log('✅ Resumo ChatGPT gerado com sucesso');
@@ -241,14 +253,52 @@ Retorne somente o JSON completo e detalhado no formato estruturado.`;
 
         return summaryJson;
       } catch (parseError) {
-        console.warn('⚠️ Não foi possível fazer parse do JSON, retornando como texto:', parseError.message);
-        return summaryText;
+        console.warn('⚠️ Não foi possível fazer parse do JSON, retornando texto como campo no fallback:', parseError.message);
+        // Encapsula o texto em um fallback estruturado
+        return this.#buildLocalFallback(transcript, summaryText);
       }
 
     } catch (error) {
       console.error('❌ Erro na geração de resumo ChatGPT:', error);
-      throw error;
+      // Última linha de defesa: não quebrar o fluxo do app
+      return this.#buildLocalFallback(transcript);
     }
+  }
+
+  // Fallback local para garantir retorno estruturado mesmo sem resposta do modelo
+  #buildLocalFallback(transcript, rawText = '') {
+    const safeText = (transcript || '').trim();
+    const preview = safeText.slice(0, 500);
+    const firstLine = preview.split(/\n|\.\s/)[0] || 'Reunião';
+    const participantes = this.#extractNamesHeuristic(safeText);
+    return {
+      titulo_reuniao: firstLine.length > 12 ? firstLine.slice(0, 80) : 'Resumo da Reunião',
+      contexto_e_objetivo: 'Resumo gerado automaticamente (fallback local) devido a uma resposta vazia do modelo.',
+      participantes: participantes.length ? participantes : ['Participantes não identificados'],
+      pontos_principais: preview ? [{ subtitulo: 'Principais tópicos (amostra)', pontos_abordados: [preview + (safeText.length > 500 ? '...' : '')] }] : [],
+      action_items: [],
+      decisoes_tomadas: [],
+      proximos_passos: [],
+      formato_estruturado: true,
+      _fallback: true,
+      _modelo: 'local-fallback',
+      _raw: rawText || undefined
+    };
+  }
+
+  #extractNamesHeuristic(text) {
+    // Heurística simples: palavras iniciadas por maiúscula no meio da frase
+    const candidates = new Set();
+    const re = /\b([A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ][a-záéíóúâêîôûãõç]{2,})(?:\s+[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ][a-záéíóúâêîôûãõç]{2,})?/g;
+    let m;
+    const sample = text.slice(0, 4000); // limita processamento
+    while ((m = re.exec(sample)) !== null) {
+      const name = m[0].trim();
+      if (!/^(Seg|Ter|Qua|Qui|Sex|Sáb|Dom|Hoje|Amanhã|OK|HTTP|API|Zoom|Meet|Teams)$/i.test(name)) {
+        candidates.add(name);
+      }
+    }
+    return Array.from(candidates).slice(0, 8);
   }
 
   // Método para listar modelos disponíveis

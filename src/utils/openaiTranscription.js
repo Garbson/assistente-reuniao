@@ -66,22 +66,68 @@ export class OpenAITranscription {
       temperature = 0.0,
       response_format = 'json',
       prompt = null,
-      timestamp_granularities = null // Para verbose_json
+      timestamp_granularities = null, // Para verbose_json
+  filename = 'audio.webm' // Nome do arquivo (com extensão)
     } = options;
 
     try {
-      const fileSizeMB = audioBlob.size / (1024 * 1024);
+  const fileSizeMB = audioBlob.size / (1024 * 1024);
       console.log(`🎤 Enviando para OpenAI Whisper: ${fileSizeMB.toFixed(1)}MB`);
       console.log(`🔧 Modelo: ${model}`);
+      console.log(`🔧 Tipo MIME: ${audioBlob.type}`);
+      console.log(`🔧 Nome do arquivo: ${filename}`);
 
       // Valida tamanho do arquivo (OpenAI permite até 25MB)
       if (fileSizeMB > 25) {
         throw new Error('Arquivo muito grande (máx: 25MB)');
       }
 
+      // Preparação de blob e nome finais (permite alterar caso haja transcode)
+      let uploadBlob = audioBlob;
+      let uploadFilename = filename;
+
+      // Para maior compatibilidade com o endpoint, convertemos webm/ogg para WAV PCM 16khz mono
+      // Isso evita falhas quando o container WebM é composto por sub-blobs concatenados.
+      try {
+        if (uploadBlob.type && (uploadBlob.type.startsWith('audio/webm') || uploadBlob.type.startsWith('audio/ogg'))) {
+          console.log('🔁 Convertendo para WAV (PCM 16kHz mono) para compatibilidade...');
+          uploadBlob = await this._transcodeToWav(uploadBlob, 16000);
+          // Ajusta extensão do arquivo
+          uploadFilename = uploadFilename.replace(/\.[^.]+$/, '.wav');
+          if (uploadFilename === filename) {
+            // Se o nome original não tinha extensão reconhecida
+            uploadFilename = 'audio.wav';
+          }
+          console.log(`✅ Transcode concluído: ${uploadBlob.type}, ${(uploadBlob.size / (1024 * 1024)).toFixed(1)}MB`);
+        }
+      } catch (txErr) {
+        console.warn('⚠️ Falha ao converter para WAV. Enviando blob original:', txErr?.message || txErr);
+        uploadBlob = audioBlob; // fallback
+        uploadFilename = filename;
+      }
+
+      // Valida tipo MIME final (aceita variações com codecs)
+      const isValidAudioType = uploadBlob.type && (
+        uploadBlob.type.startsWith('audio/webm') ||
+        uploadBlob.type.startsWith('audio/wav') ||
+        uploadBlob.type.startsWith('audio/mp3') ||
+        uploadBlob.type.startsWith('audio/mpeg') ||
+        uploadBlob.type.startsWith('audio/mp4') ||
+        uploadBlob.type.startsWith('audio/ogg') ||
+        uploadBlob.type.startsWith('audio/m4a') ||
+        uploadBlob.type.startsWith('audio/flac')
+      );
+
+      if (!isValidAudioType) {
+        console.warn(`⚠️ Tipo MIME inválido ou ausente: ${uploadBlob.type}, corrigindo para webm`);
+        uploadBlob = new Blob([uploadBlob], { type: 'audio/webm' });
+        uploadFilename = uploadFilename.replace(/\.[^.]+$/, '.webm');
+        console.log(`✅ Blob convertido para: ${uploadBlob.type}`);
+      }
+
       // Prepara FormData para upload
       const formData = new FormData();
-      formData.append('file', audioBlob, 'audio.webm');
+  formData.append('file', uploadBlob, uploadFilename);
       formData.append('model', model);
       formData.append('language', language);
       formData.append('temperature', temperature.toString());
@@ -409,5 +455,113 @@ export class OpenAITranscription {
 
     console.log(`🔄 Retry ${attempt} com configurações otimizadas:`, optimizedOptions);
     return await this.transcribe(audioBlob, optimizedOptions);
+  }
+
+  // -------- Helpers: Transcoding to WAV --------
+  async _transcodeToWav(blob, targetSampleRate = 16000) {
+    // Decode to AudioBuffer
+    const audioBuffer = await this._decodeToAudioBuffer(blob);
+    // Convert to mono and resample
+    const mono = this._toMono(audioBuffer);
+    const resampled = await this._resampleAudioBuffer(mono, targetSampleRate);
+    // Encode to WAV PCM 16-bit
+    const wavBlob = this._encodeWav(resampled);
+    return wavBlob;
+  }
+
+  async _decodeToAudioBuffer(blob) {
+    const arrayBuffer = await blob.arrayBuffer();
+    const AudioContextClass = window.OfflineAudioContext || window.webkitOfflineAudioContext || window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      throw new Error('Web Audio API não disponível para decodificar áudio');
+    }
+    // Use AudioContext to decode
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    try {
+      const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+      return audioBuffer;
+    } finally {
+      // Try to close context to release resources
+      try { ctx.close(); } catch (_) {}
+    }
+  }
+
+  _toMono(audioBuffer) {
+    if (audioBuffer.numberOfChannels === 1) return audioBuffer;
+    const length = audioBuffer.length;
+    const sampleRate = audioBuffer.sampleRate;
+    const monoBuffer = new (window.AudioContext || window.webkitAudioContext)().createBuffer(1, length, sampleRate);
+    const monoData = monoBuffer.getChannelData(0);
+    const channels = audioBuffer.numberOfChannels;
+    for (let ch = 0; ch < channels; ch++) {
+      const data = audioBuffer.getChannelData(ch);
+      for (let i = 0; i < length; i++) {
+        monoData[i] += data[i] / channels;
+      }
+    }
+    return monoBuffer;
+  }
+
+  async _resampleAudioBuffer(audioBuffer, targetRate) {
+    if (audioBuffer.sampleRate === targetRate && audioBuffer.numberOfChannels === 1 && audioBuffer.getChannelData) {
+      return audioBuffer;
+    }
+    const channels = 1;
+    const duration = audioBuffer.duration;
+    const frameCount = Math.ceil(duration * targetRate);
+    const offline = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(channels, frameCount, targetRate);
+    const source = offline.createBufferSource();
+    const buffer = audioBuffer; // always an AudioBuffer now
+    source.buffer = buffer;
+    source.connect(offline.destination);
+    source.start(0);
+    const rendered = await offline.startRendering();
+    return rendered;
+  }
+
+  _encodeWav(audioBuffer) {
+    const numOfChan = 1;
+    const sampleRate = audioBuffer.sampleRate;
+    const samples = audioBuffer.getChannelData(0);
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+
+    // RIFF chunk descriptor
+    this._writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + samples.length * 2, true);
+    this._writeString(view, 8, 'WAVE');
+
+    // FMT sub-chunk
+    this._writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM)
+    view.setUint16(20, 1, true);  // AudioFormat (1 for PCM)
+    view.setUint16(22, numOfChan, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * numOfChan * 2, true); // ByteRate
+    view.setUint16(32, numOfChan * 2, true); // BlockAlign
+    view.setUint16(34, 16, true); // BitsPerSample
+
+    // data sub-chunk
+    this._writeString(view, 36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+
+    // PCM conversion
+    this._floatTo16BitPCM(view, 44, samples);
+
+    return new Blob([view], { type: 'audio/wav' });
+  }
+
+  _writeString(view, offset, string) {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  }
+
+  _floatTo16BitPCM(output, offset, input) {
+    for (let i = 0; i < input.length; i++, offset += 2) {
+      let s = Math.max(-1, Math.min(1, input[i]));
+      s = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      output.setInt16(offset, s, true);
+    }
   }
 }
